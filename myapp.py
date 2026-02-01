@@ -1594,8 +1594,11 @@ if page == "prediction":
         st.session_state.ml_models = MLModels()
     
     # Add tabs for Training and Prediction
-    main_tabs = st.tabs(["🎓 Train Model"])
+    main_tabs = st.tabs(["🎓 Train Model", "🔮 Make Predictions"])
     
+    # ===========================================
+    # TAB 1: TRAIN MODEL
+    # ===========================================
     with main_tabs[0]:
         st.subheader("🎓 Train New Regression Model")
         
@@ -1696,7 +1699,7 @@ if page == "prediction":
                 
                 # ML Configuration - SIMPLIFIED
                 st.subheader("⚙️ Regression Configuration")
-                st.info("🤖 All parameters are automatically optimized for regression tasks.")
+                st.info("🤖 We will use GridSearchCV to find the best parameters for each regression model.")
                 
                 col1, col2, col3 = st.columns(3)
                 
@@ -1709,19 +1712,18 @@ if page == "prediction":
                 with col3:
                     st.metric("Cross-Validation", "5-fold", help="Automatically set to 5-fold CV")
                 
-                with st.expander("🔧 Regression Models to be Trained", expanded=False):
+                with st.expander("🔧 Regression Models to be Tuned", expanded=False):
                     models_info = """
                     **Linear Models:**
-                    - Linear Regression
-                    - Ridge Regression (L2 regularization)
-                    - Lasso Regression (L1 regularization)  
-                    - ElasticNet (L1 + L2 regularization)
+                    - Linear Regression (fit_intercept)
+                    - Ridge Regression (alpha, solver)
+                    - Lasso Regression (alpha, selection)  
                     
                     **Tree-based Models:**
-                    - Random Forest Regressor
-                    - Decision Tree Regressor
-                    - Gradient Boosting Regressor
+                    - Random Forest Regressor (n_estimators, max_depth)
+                    - Gradient Boosting Regressor (learning_rate, n_estimators)
                     
+                    *All models will undergo hyperparameter optimization.*
                     """
                     st.markdown(models_info)
                 
@@ -1733,7 +1735,7 @@ if page == "prediction":
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    with st.spinner("🤖 Running automated regression pipeline..."):
+                    with st.spinner("🤖 Running automated regression pipeline with hyperparameter tuning..."):
                         try:
                             # Update progress
                             status_text.text("🔄 Preparing data for regression...")
@@ -1744,7 +1746,7 @@ if page == "prediction":
                             st.write(f"Debug: Target column '{target_column}' selected")
                             
                             # Update progress
-                            status_text.text("🔄 Running regression pipeline...")
+                            status_text.text("🔄 Tuning models (this may take a moment)...")
                             progress_bar.progress(30)
                             
                             # Run the complete regression pipeline
@@ -1796,6 +1798,18 @@ if page == "prediction":
                 
                 results = st.session_state.ml_results
                 selected_dataset = getattr(st.session_state, 'selected_dataset', 'Unknown')
+                
+                # Check for model bundle
+                bundle_path = "regression_model_bundle.zip"
+                if os.path.exists(bundle_path):
+                    with open(bundle_path, "rb") as fp:
+                        btn = st.download_button(
+                            label="📥 Download Trained Model Bundle (For Prediction)",
+                            data=fp,
+                            file_name="regression_model_bundle.zip",
+                            mime="application/zip",
+                            use_container_width=True
+                        )
                 
                 # Quick summary at the top
                 col1, col2, col3, col4 = st.columns(4)
@@ -1860,7 +1874,7 @@ if page == "prediction":
                             summary.append({
                                 'Model': name,
                                 'R² Score': round(info['mean_score'], 4),
-                                'CV Std': round(info['std_score'], 4),
+                                'Best Params': str(info.get('best_params', 'N/A')),
                                 'Is Best': name == results['best_model_name']
                             })
                         
@@ -1985,6 +1999,112 @@ if page == "prediction":
                                 st.write(f"- Removed Features: {len(summary['removed_features'])}")
                                 with st.expander("Show removed features"):
                                     st.write(summary['removed_features'])
+    
+    # ===========================================
+    # TAB 2: MAKE PREDICTIONS
+    # ===========================================
+    with main_tabs[1]:
+        st.subheader("🔮 Predict on New Data")
+        st.markdown("Upload a trained model bundle and a new dataset to generate predictions.")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.info("1️⃣ Upload Model Bundle")
+            uploaded_model = st.file_uploader(
+                "Upload 'regression_model_bundle.zip'",
+                type=['zip'],
+                key="model_uploader"
+            )
+            
+            if uploaded_model:
+                # Save to temp file and load
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_file:
+                    tmp_file.write(uploaded_model.getvalue())
+                    model_path = tmp_file.name
+                
+                try:
+                    if st.session_state.ml_models.load_model_from_zip(model_path):
+                        st.success(f"✅ Model loaded: {st.session_state.ml_models.best_model_name}")
+                        st.write(f"**Target:** {st.session_state.ml_models.target_column}")
+                        st.write(f"**Best R²:** {st.session_state.ml_models.best_score:.4f}")
+                        st.session_state.model_loaded = True
+                    else:
+                        st.error("❌ Failed to load model bundle.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                finally:
+                    os.unlink(model_path)
+        
+        with col2:
+            st.info("2️⃣ Upload New Data")
+            uploaded_data = st.file_uploader(
+                "Upload new dataset (CSV/Excel)",
+                type=['csv', 'xlsx'],
+                key="prediction_data_uploader"
+            )
+            
+            if uploaded_data:
+                # Reuse loader logic
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_data.name.split('.')[-1]}") as tmp_file:
+                    tmp_file.write(uploaded_data.getvalue())
+                    data_path = tmp_file.name
+                
+                try:
+                    new_df = st.session_state.loader.loader(data_path)
+                    st.success(f"✅ Data loaded: {new_df.shape[0]} rows × {new_df.shape[1]} columns")
+                    st.session_state.new_prediction_df = new_df
+                except Exception as e:
+                    st.error(f"Error loading data: {e}")
+                finally:
+                    os.unlink(data_path)
+
+        st.markdown("---")
+        
+        # Predict Button
+        if st.session_state.get('model_loaded') and st.session_state.get('new_prediction_df') is not None:
+            if st.button("🔮 Generate Predictions", type="primary", use_container_width=True):
+                with st.spinner("Generating predictions..."):
+                    try:
+                        predictions = st.session_state.ml_models.predict_new_data(st.session_state.new_prediction_df)
+                        
+                        if predictions is not None:
+                            # Add predictions to dataframe
+                            result_df = st.session_state.new_prediction_df.copy()
+                            target_col = st.session_state.ml_models.target_column
+                            prediction_col = f"Predicted_{target_col}"
+                            result_df[prediction_col] = predictions
+                            
+                            st.success("✅ Predictions generated successfully!")
+                            
+                            # Show results
+                            st.subheader("📊 Prediction Results")
+                            st.dataframe(result_df.head(10), use_container_width=True)
+                            
+                            # Download results
+                            csv = result_df.to_csv(index=False)
+                            st.download_button(
+                                label="📥 Download Predictions (CSV)",
+                                data=csv,
+                                file_name=f"predictions_{target_col}.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+                            
+                            # Visualization of predictions distribution
+                            st.subheader("📈 Predictions Distribution")
+                            fig = px.histogram(
+                                result_df, 
+                                x=prediction_col,
+                                title=f"Distribution of Predicted {target_col}",
+                                marginal="box"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                    except Exception as e:
+                        st.error(f"Error generating predictions: {str(e)}")
+        elif not st.session_state.get('model_loaded') and not st.session_state.get('new_prediction_df'):
+             st.info("👈 Upload both a model and a dataset to start.")
                 
                 
 

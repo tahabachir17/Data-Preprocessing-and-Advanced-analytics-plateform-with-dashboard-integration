@@ -15,6 +15,9 @@ from sklearn.neural_network import MLPRegressor
 import warnings
 import joblib
 import os
+import zipfile
+import shutil
+import tempfile
 warnings.filterwarnings('ignore')
 
 class MLModels:
@@ -36,6 +39,8 @@ class MLModels:
         self.model_save_path = "best_regression_model.pkl"
         self.scaler_save_path = "regression_scaler.pkl"
         self.encoders_save_path = "regression_encoders.pkl"
+        self.metadata_save_path = "model_metadata.pkl"
+        self.zip_save_path = "regression_model_bundle.zip"
         
     def get_available_targets(self, df):
         """
@@ -240,21 +245,52 @@ class MLModels:
     
     def get_regression_models(self):
         """
-        Get regression models with optimized parameters
+        Get regression models with hyperparameter grids for tuning
         """
-        return {
-            'Linear Regression': LinearRegression(),
-            'Ridge Regression': Ridge(alpha=1.0),
-            'Lasso Regression': Lasso(alpha=1.0, max_iter=1000),
-            'Random Forest': RandomForestRegressor(random_state=42, n_estimators=100),
-            'Decision Tree': DecisionTreeRegressor(random_state=42, max_depth=10),
-            'Gradient Boosting': GradientBoostingRegressor(random_state=42, n_estimators=100),
-            
+        models = {
+            'Linear Regression': {
+                'model': LinearRegression(),
+                'params': {
+                    'fit_intercept': [True, False]
+                }
+            },
+            'Ridge Regression': {
+                'model': Ridge(),
+                'params': {
+                    'alpha': [0.1, 1.0, 10.0],
+                    'solver': ['auto', 'svd', 'cholesky', 'lsqr', 'sparse_cg']
+                }
+            },
+            'Lasso Regression': {
+                'model': Lasso(max_iter=2000),
+                'params': {
+                    'alpha': [0.1, 1.0, 10.0],
+                    'selection': ['cyclic', 'random']
+                }
+            },
+            'Random Forest': {
+                'model': RandomForestRegressor(random_state=42),
+                'params': {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [None, 10, 20],
+                    'min_samples_split': [2, 5],
+                    'min_samples_leaf': [1, 2]
+                }
+            },
+            'Gradient Boosting': {
+                'model': GradientBoostingRegressor(random_state=42),
+                'params': {
+                    'n_estimators': [50, 100, 200],
+                    'learning_rate': [0.01, 0.1, 0.2],
+                    'max_depth': [3, 5, 7]
+                }
+            }
         }
+        return models
     
     def train_and_select_best_model(self, X_train, y_train, cv_folds=5):
         """
-        Train all regression models and return only the best performing one
+        Train all regression models using GridSearchCV and return only the best performing one
         """
         models = self.get_regression_models()
         model_scores = {}
@@ -269,28 +305,40 @@ class MLModels:
         
         # Train all models and evaluate
         successful_models = 0
-        for name, model in models.items():
+        for name, config in models.items():
             try:
-                print(f"Training {name}...")
+                print(f"Tuning {name}...")
+                model = config['model']
+                params = config['params']
                 
-                # Perform cross-validation
-                cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring='r2')
+                # Perform Grid Search
+                grid_search = GridSearchCV(
+                    estimator=model,
+                    param_grid=params,
+                    cv=cv_folds,
+                    scoring='r2',
+                    n_jobs=-1,  # Use all available cores
+                    verbose=1
+                )
                 
-                if len(cv_scores) == 0 or np.isnan(cv_scores).all():
+                grid_search.fit(X_train, y_train)
+                
+                best_cv_score = grid_search.best_score_
+                best_params = grid_search.best_params_
+                best_estimator = grid_search.best_estimator_
+                
+                if np.isnan(best_cv_score):
                     print(f"Warning: {name} produced invalid CV scores")
                     continue
                 
                 model_scores[name] = {
-                    'mean_score': cv_scores.mean(),
-                    'std_score': cv_scores.std(),
-                    'cv_scores': cv_scores,
-                    'model': model
+                    'mean_score': best_cv_score,
+                    'best_params': best_params,
+                    'model': best_estimator
                 }
                 
-                # Train the model on full training data
-                model.fit(X_train, y_train)
                 successful_models += 1
-                print(f"{name}: R² = {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f}) ✓")
+                print(f"{name}: Best R² = {best_cv_score:.4f} with params {best_params} ✓")
                 
             except Exception as e:
                 print(f"Error training {name}: {str(e)}")
@@ -385,72 +433,77 @@ class MLModels:
 
     def save_model_and_preprocessors(self):
         """
-        Save the best model and preprocessors for future predictions
+        Save the best model and preprocessors to a ZIP bundle
         """
         try:
-            # Save the best model
-            joblib.dump(self.best_model, self.model_save_path)
-            print(f"Best model ({self.best_model_name}) saved to {self.model_save_path}")
-            
-            # Save the scaler
-            joblib.dump(self.scaler, self.scaler_save_path)
-            print(f"Scaler saved to {self.scaler_save_path}")
-            
-            # Save the label encoders
-            joblib.dump(self.label_encoders, self.encoders_save_path)
-            print(f"Label encoders saved to {self.encoders_save_path}")
-            
-            # Save model metadata
-            metadata = {
-                'best_model_name': self.best_model_name,
-                'best_score': self.best_score,
-                'target_column': self.target_column,
-                'feature_names': self.feature_names,
-                'numerical_features': self.numerical_features,
-                'categorical_features': self.categorical_features,
-                'removed_features': self.removed_features
-            }
-            joblib.dump(metadata, 'model_metadata.pkl')
-            print("Model metadata saved")
+            # Create a temporary directory to store files before zipping
+            with tempfile.TemporaryDirectory() as temp_dir:
+                model_path = os.path.join(temp_dir, self.model_save_path)
+                scaler_path = os.path.join(temp_dir, self.scaler_save_path)
+                encoders_path = os.path.join(temp_dir, self.encoders_save_path)
+                metadata_path = os.path.join(temp_dir, self.metadata_save_path)
+                
+                # Save artifacts
+                joblib.dump(self.best_model, model_path)
+                joblib.dump(self.scaler, scaler_path)
+                joblib.dump(self.label_encoders, encoders_path)
+                
+                metadata = {
+                    'best_model_name': self.best_model_name,
+                    'best_score': self.best_score,
+                    'target_column': self.target_column,
+                    'feature_names': self.feature_names,
+                    'numerical_features': self.numerical_features,
+                    'categorical_features': self.categorical_features,
+                    'removed_features': self.removed_features
+                }
+                joblib.dump(metadata, metadata_path)
+                
+                # Create ZIP file
+                with zipfile.ZipFile(self.zip_save_path, 'w') as zipf:
+                    zipf.write(model_path, self.model_save_path)
+                    zipf.write(scaler_path, self.scaler_save_path)
+                    zipf.write(encoders_path, self.encoders_save_path)
+                    zipf.write(metadata_path, self.metadata_save_path)
+                
+                print(f"Model bundle saved to cross-platform zip: {self.zip_save_path}")
+                return self.zip_save_path
             
         except Exception as e:
-            print(f"Error saving model: {e}")
+            print(f"Error saving model bundle: {e}")
+            return None
 
-    def load_model_and_preprocessors(self):
+    def load_model_from_zip(self, zip_path):
         """
-        Load the saved model and preprocessors
+        Load model and preprocessors from a ZIP file
         """
         try:
-            if not os.path.exists(self.model_save_path):
-                raise FileNotFoundError("No saved model found. Please train a model first.")
+            if not os.path.exists(zip_path):
+                raise FileNotFoundError(f"Zip file not found: {zip_path}")
             
-            # Load model
-            self.best_model = joblib.load(self.model_save_path)
-            print("Model loaded successfully")
-            
-            # Load scaler
-            self.scaler = joblib.load(self.scaler_save_path)
-            print("Scaler loaded successfully")
-            
-            # Load encoders
-            self.label_encoders = joblib.load(self.encoders_save_path)
-            print("Label encoders loaded successfully")
-            
-            # Load metadata
-            metadata = joblib.load('model_metadata.pkl')
-            self.best_model_name = metadata['best_model_name']
-            self.best_score = metadata['best_score']
-            self.target_column = metadata['target_column']
-            self.feature_names = metadata['feature_names']
-            self.numerical_features = metadata['numerical_features']
-            self.categorical_features = metadata['categorical_features']
-            self.removed_features = metadata['removed_features']
-            
-            print("Model metadata loaded successfully")
-            return True
-            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                with zipfile.ZipFile(zip_path, 'r') as zipf:
+                    zipf.extractall(temp_dir)
+                
+                # Load components
+                self.best_model = joblib.load(os.path.join(temp_dir, self.model_save_path))
+                self.scaler = joblib.load(os.path.join(temp_dir, self.scaler_save_path))
+                self.label_encoders = joblib.load(os.path.join(temp_dir, self.encoders_save_path))
+                
+                metadata = joblib.load(os.path.join(temp_dir, self.metadata_save_path))
+                self.best_model_name = metadata['best_model_name']
+                self.best_score = metadata['best_score']
+                self.target_column = metadata['target_column']
+                self.feature_names = metadata['feature_names']
+                self.numerical_features = metadata['numerical_features']
+                self.categorical_features = metadata['categorical_features']
+                self.removed_features = metadata['removed_features']
+                
+                print("Model bundle loaded successfully")
+                return True
+                
         except Exception as e:
-            print(f"Error loading model: {e}")
+            print(f"Error loading model bundle: {e}")
             return False
 
     def predict_new_data(self, new_df):
