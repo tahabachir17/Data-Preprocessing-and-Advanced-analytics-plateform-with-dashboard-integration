@@ -20,6 +20,8 @@ from src.data_processing.transformer import DataTransformer
 from src.visualization.charts import DataVisualizer
 from src.visualization.dashboard import Dashboard
 from src.analytics.ml_models import MLModels
+from src.analytics.statistical import StatisticalAnalyzer
+from src.analytics.advanced_analytics import AdvancedAnalytics
 
 # Configuration du logging pour Streamlit
 logging.basicConfig(
@@ -1446,8 +1448,14 @@ elif page == "visualization":
 # Advanced Analytics Section
 elif page == "analytics":
     st.header("🔬 Advanced Analytics")
-    st.markdown("Statistical analysis and data exploration tools")
+    st.markdown("Statistical analysis, hypothesis testing, and data quality tools")
     st.markdown("---")
+    
+    # Initialize analyzers
+    if 'stat_analyzer' not in st.session_state:
+        st.session_state.stat_analyzer = StatisticalAnalyzer()
+    if 'adv_analytics' not in st.session_state:
+        st.session_state.adv_analytics = AdvancedAnalytics()
     
     # Get available processed datasets for analytics
     available_datasets = []
@@ -1482,9 +1490,19 @@ elif page == "analytics":
         current_df = dataset_options[selected_dataset]
         st.info(f"Analyzing {selected_dataset}: {current_df.shape[0]:,} rows × {current_df.shape[1]} columns")
         
-        # Analytics tabs
-        analytics_tab1, analytics_tab2, analytics_tab3 = st.tabs(["📊 Descriptive Stats", "🔗 Correlation Analysis", "📈 Distribution Analysis"])
+        # Expanded Analytics tabs
+        analytics_tab1, analytics_tab2, analytics_tab3, analytics_tab4, analytics_tab5, analytics_tab6 = st.tabs([
+            "📊 Descriptive Stats", 
+            "🔗 Correlation Analysis", 
+            "📈 Distribution Analysis",
+            "🧪 Hypothesis Testing",
+            "🎯 Outlier Detection",
+            "📋 Data Quality Report"
+        ])
         
+        # =============================================
+        # TAB 1: DESCRIPTIVE STATISTICS
+        # =============================================
         with analytics_tab1:
             st.subheader("📊 Descriptive Statistics")
             
@@ -1493,6 +1511,12 @@ elif page == "analytics":
             numeric_df = current_df.select_dtypes(include=[np.number])
             if not numeric_df.empty:
                 st.dataframe(numeric_df.describe(), use_container_width=True)
+                
+                # Extended stats
+                with st.expander("📈 Extended Statistics (Skewness, Kurtosis, etc.)"):
+                    ext_stats = st.session_state.adv_analytics.get_summary_statistics_extended(current_df)
+                    if 'extended_statistics' in ext_stats:
+                        st.dataframe(ext_stats['extended_statistics'], use_container_width=True)
             else:
                 st.info("No numerical columns found")
             
@@ -1512,6 +1536,9 @@ elif page == "analytics":
             else:
                 st.info("No categorical columns found")
         
+        # =============================================
+        # TAB 2: CORRELATION ANALYSIS
+        # =============================================
         with analytics_tab2:
             st.subheader("🔗 Correlation Analysis")
             
@@ -1547,15 +1574,28 @@ elif page == "analytics":
                     st.dataframe(pd.DataFrame(high_corr_pairs), use_container_width=True)
                 else:
                     st.info("No high correlation pairs found")
+                
+                # Multicollinearity detection
+                with st.expander("🔍 Multicollinearity Analysis"):
+                    threshold = st.slider("Correlation threshold", 0.7, 0.99, 0.85, 0.05)
+                    multi_result = st.session_state.adv_analytics.detect_multicollinearity(current_df, threshold)
+                    if 'error' not in multi_result:
+                        st.write(f"**High correlation pairs found:** {multi_result['n_high_correlations']}")
+                        st.write(f"**Recommendation:** {multi_result['recommendation']}")
+                        if multi_result['potentially_redundant_features']:
+                            st.warning(f"Potentially redundant features: {', '.join(multi_result['potentially_redundant_features'])}")
             else:
                 st.info("No numerical columns available for correlation analysis")
         
+        # =============================================
+        # TAB 3: DISTRIBUTION ANALYSIS
+        # =============================================
         with analytics_tab3:
             st.subheader("📈 Distribution Analysis")
             
             numeric_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
             if numeric_cols:
-                selected_col = st.selectbox("Select column for distribution analysis:", numeric_cols)
+                selected_col = st.selectbox("Select column for distribution analysis:", numeric_cols, key="dist_col")
                 
                 if selected_col:
                     col1, col2 = st.columns(2)
@@ -1578,11 +1618,499 @@ elif page == "analytics":
                             title=f"Box Plot of {selected_col}"
                         )
                         st.plotly_chart(fig_box, use_container_width=True)
+                    
+                    # Normality testing
+                    st.subheader("🔬 Normality Tests")
+                    normality_result = st.session_state.stat_analyzer.test_normality(current_df[selected_col])
+                    
+                    if 'error' not in normality_result:
+                        col1, col2, col3 = st.columns(3)
+                        
+                        for i, (test_name, test_result) in enumerate(normality_result.get('tests', {}).items()):
+                            if 'error' not in test_result:
+                                with [col1, col2, col3][i % 3]:
+                                    is_normal = test_result.get('is_normal', False)
+                                    st.metric(
+                                        test_name.replace('_', ' ').title(),
+                                        f"p = {test_result['p_value']:.4f}",
+                                        delta="Normal" if is_normal else "Not Normal",
+                                        delta_color="normal" if is_normal else "inverse"
+                                    )
+                        
+                        overall = normality_result.get('overall_conclusion', {})
+                        if overall.get('is_normal') is not None:
+                            if overall['is_normal']:
+                                st.success(f"✅ Data appears normally distributed ({overall['normal_tests']}/{overall['total_tests']} tests passed)")
+                            else:
+                                st.warning(f"⚠️ Data does not appear normally distributed ({overall['normal_tests']}/{overall['total_tests']} tests passed)")
+                    
+                    # Skewness and Kurtosis
+                    with st.expander("📊 Skewness & Kurtosis Analysis"):
+                        sk_result = st.session_state.stat_analyzer.get_skewness_kurtosis(current_df[selected_col])
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Skewness", f"{sk_result['skewness']:.4f}")
+                            st.caption(sk_result['skewness_interpretation'])
+                        with col2:
+                            st.metric("Kurtosis", f"{sk_result['kurtosis']:.4f}")
+                            st.caption(sk_result['kurtosis_interpretation'])
             else:
                 st.info("No numerical columns available for distribution analysis")
+        
+        # =============================================
+        # TAB 4: HYPOTHESIS TESTING
+        # =============================================
+        with analytics_tab4:
+            st.subheader("🧪 Hypothesis Testing")
+            st.markdown("Perform statistical hypothesis tests on your data")
+            
+            test_type = st.selectbox(
+                "Select Test Type:",
+                ["One-Sample T-Test", "Two-Sample T-Test", "Paired T-Test", "ANOVA", "Chi-Square Test", "Mann-Whitney U", "Kruskal-Wallis"]
+            )
+            
+            numeric_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
+            categorical_cols = current_df.select_dtypes(include=['object', 'category']).columns.tolist()
+            
+            st.markdown("---")
+            
+            if test_type == "One-Sample T-Test":
+                st.write("**One-Sample T-Test**: Compare sample mean to a hypothesized population mean")
+                
+                if numeric_cols:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        test_col = st.selectbox("Select column:", numeric_cols, key="onesamp_col")
+                    with col2:
+                        pop_mean = st.number_input("Hypothesized population mean:", value=0.0)
+                    
+                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="onesamp_alpha")
+                    
+                    if st.button("Run One-Sample T-Test", type="primary"):
+                        result = st.session_state.stat_analyzer.one_sample_ttest(
+                            current_df[test_col], pop_mean, alpha
+                        )
+                        
+                        if 'error' not in result:
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Sample Mean", f"{result['sample_mean']:.4f}")
+                            with col2:
+                                st.metric("t-Statistic", f"{result['t_statistic']:.4f}")
+                            with col3:
+                                st.metric("p-Value", f"{result['p_value']:.6f}")
+                            with col4:
+                                st.metric("Cohen's d", f"{result['cohens_d']:.4f}")
+                            
+                            if result['reject_null']:
+                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                            else:
+                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                            
+                            st.caption(f"Effect size: {result['effect_size_interpretation']}")
+                        else:
+                            st.error(result['error'])
+                else:
+                    st.warning("No numeric columns available")
+            
+            elif test_type == "Two-Sample T-Test":
+                st.write("**Two-Sample T-Test**: Compare means between two independent groups")
+                
+                if numeric_cols and categorical_cols:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="twosamp_val")
+                    with col2:
+                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="twosamp_grp")
+                    
+                    groups = current_df[group_col].dropna().unique()
+                    if len(groups) >= 2:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            group1 = st.selectbox("Group 1:", groups, key="twosamp_g1")
+                        with col2:
+                            group2 = st.selectbox("Group 2:", [g for g in groups if g != group1], key="twosamp_g2")
+                        
+                        equal_var = st.checkbox("Assume equal variances (unchecked = Welch's t-test)", value=False)
+                        alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="twosamp_alpha")
+                        
+                        if st.button("Run Two-Sample T-Test", type="primary"):
+                            g1_data = current_df[current_df[group_col] == group1][value_col]
+                            g2_data = current_df[current_df[group_col] == group2][value_col]
+                            
+                            result = st.session_state.stat_analyzer.two_sample_ttest(
+                                g1_data, g2_data, alpha, equal_var
+                            )
+                            
+                            if 'error' not in result:
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric(f"Mean ({group1})", f"{result['group1_mean']:.4f}")
+                                with col2:
+                                    st.metric(f"Mean ({group2})", f"{result['group2_mean']:.4f}")
+                                with col3:
+                                    st.metric("t-Statistic", f"{result['t_statistic']:.4f}")
+                                with col4:
+                                    st.metric("p-Value", f"{result['p_value']:.6f}")
+                                
+                                if result['reject_null']:
+                                    st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                                else:
+                                    st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                                
+                                st.caption(f"Effect size (Cohen's d = {result['cohens_d']:.4f}): {result['effect_size_interpretation']}")
+                                
+                                # Levene's test info
+                                levene = result['levene_test']
+                                if not levene['equal_variances']:
+                                    st.warning(f"⚠️ Levene's test suggests unequal variances (p = {levene['p_value']:.4f}). Consider using Welch's t-test.")
+                            else:
+                                st.error(result['error'])
+                    else:
+                        st.warning("Need at least 2 groups for comparison")
+                else:
+                    st.warning("Need numeric and categorical columns for comparison")
+            
+            elif test_type == "Paired T-Test":
+                st.write("**Paired T-Test**: Compare means from related samples (before/after)")
+                
+                if len(numeric_cols) >= 2:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        before_col = st.selectbox("Before/First measurement:", numeric_cols, key="paired_before")
+                    with col2:
+                        after_col = st.selectbox("After/Second measurement:", [c for c in numeric_cols if c != before_col], key="paired_after")
+                    
+                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="paired_alpha")
+                    
+                    if st.button("Run Paired T-Test", type="primary"):
+                        result = st.session_state.stat_analyzer.paired_ttest(
+                            current_df[before_col], current_df[after_col], alpha
+                        )
+                        
+                        if 'error' not in result:
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Before Mean", f"{result['before_mean']:.4f}")
+                            with col2:
+                                st.metric("After Mean", f"{result['after_mean']:.4f}")
+                            with col3:
+                                st.metric("Mean Difference", f"{result['mean_difference']:.4f}")
+                            with col4:
+                                st.metric("p-Value", f"{result['p_value']:.6f}")
+                            
+                            if result['reject_null']:
+                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                            else:
+                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                        else:
+                            st.error(result['error'])
+                else:
+                    st.warning("Need at least 2 numeric columns for paired test")
+            
+            elif test_type == "ANOVA":
+                st.write("**One-Way ANOVA**: Compare means across multiple groups")
+                
+                if numeric_cols and categorical_cols:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="anova_val")
+                    with col2:
+                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="anova_grp")
+                    
+                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="anova_alpha")
+                    
+                    if st.button("Run ANOVA", type="primary"):
+                        result = st.session_state.stat_analyzer.one_way_anova(
+                            current_df, value_col, group_col, alpha
+                        )
+                        
+                        if 'error' not in result:
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("F-Statistic", f"{result['f_statistic']:.4f}")
+                            with col2:
+                                st.metric("p-Value", f"{result['p_value']:.6f}")
+                            with col3:
+                                st.metric("η² (Eta-squared)", f"{result['eta_squared']:.4f}")
+                            
+                            if result['reject_null']:
+                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                            else:
+                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                            
+                            st.caption(f"Effect size: {result['effect_size_interpretation']}")
+                            
+                            # Group statistics
+                            st.subheader("Group Statistics")
+                            st.dataframe(pd.DataFrame(result['group_statistics']), use_container_width=True)
+                        else:
+                            st.error(result['error'])
+                else:
+                    st.warning("Need numeric and categorical columns for ANOVA")
+            
+            elif test_type == "Chi-Square Test":
+                st.write("**Chi-Square Test of Independence**: Test association between categorical variables")
+                
+                if len(categorical_cols) >= 2:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        cat1 = st.selectbox("First categorical variable:", categorical_cols, key="chi_cat1")
+                    with col2:
+                        cat2 = st.selectbox("Second categorical variable:", [c for c in categorical_cols if c != cat1], key="chi_cat2")
+                    
+                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="chi_alpha")
+                    
+                    if st.button("Run Chi-Square Test", type="primary"):
+                        result = st.session_state.stat_analyzer.chi_square_independence(
+                            current_df, cat1, cat2, alpha
+                        )
+                        
+                        if 'error' not in result:
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("χ² Statistic", f"{result['chi_square_statistic']:.4f}")
+                            with col2:
+                                st.metric("p-Value", f"{result['p_value']:.6f}")
+                            with col3:
+                                st.metric("Cramér's V", f"{result['cramers_v']:.4f}")
+                            
+                            if result['reject_null']:
+                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                            else:
+                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                            
+                            st.caption(f"Effect size: {result['effect_size_interpretation']}")
+                        else:
+                            st.error(result['error'])
+                else:
+                    st.warning("Need at least 2 categorical columns for chi-square test")
+            
+            elif test_type == "Mann-Whitney U":
+                st.write("**Mann-Whitney U Test**: Non-parametric alternative to two-sample t-test")
+                
+                if numeric_cols and categorical_cols:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="mwu_val")
+                    with col2:
+                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="mwu_grp")
+                    
+                    groups = current_df[group_col].dropna().unique()
+                    if len(groups) >= 2:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            group1 = st.selectbox("Group 1:", groups, key="mwu_g1")
+                        with col2:
+                            group2 = st.selectbox("Group 2:", [g for g in groups if g != group1], key="mwu_g2")
+                        
+                        if st.button("Run Mann-Whitney U Test", type="primary"):
+                            g1_data = current_df[current_df[group_col] == group1][value_col]
+                            g2_data = current_df[current_df[group_col] == group2][value_col]
+                            
+                            result = st.session_state.stat_analyzer.mann_whitney_u(g1_data, g2_data)
+                            
+                            if 'error' not in result:
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("U Statistic", f"{result['u_statistic']:.4f}")
+                                with col2:
+                                    st.metric("p-Value", f"{result['p_value']:.6f}")
+                                with col3:
+                                    st.metric("Rank-Biserial r", f"{result['rank_biserial_r']:.4f}")
+                                
+                                if result['reject_null']:
+                                    st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                                else:
+                                    st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                            else:
+                                st.error(result['error'])
+                else:
+                    st.warning("Need numeric and categorical columns for Mann-Whitney U test")
+            
+            elif test_type == "Kruskal-Wallis":
+                st.write("**Kruskal-Wallis H Test**: Non-parametric alternative to one-way ANOVA")
+                
+                if numeric_cols and categorical_cols:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="kw_val")
+                    with col2:
+                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="kw_grp")
+                    
+                    if st.button("Run Kruskal-Wallis Test", type="primary"):
+                        result = st.session_state.stat_analyzer.kruskal_wallis(
+                            current_df, value_col, group_col
+                        )
+                        
+                        if 'error' not in result:
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("H Statistic", f"{result['h_statistic']:.4f}")
+                            with col2:
+                                st.metric("p-Value", f"{result['p_value']:.6f}")
+                            
+                            if result['reject_null']:
+                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
+                            else:
+                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
+                            
+                            st.subheader("Group Statistics (Medians)")
+                            st.dataframe(pd.DataFrame(result['group_statistics']), use_container_width=True)
+                        else:
+                            st.error(result['error'])
+                else:
+                    st.warning("Need numeric and categorical columns for Kruskal-Wallis test")
+        
+        # =============================================
+        # TAB 5: OUTLIER DETECTION
+        # =============================================
+        with analytics_tab5:
+            st.subheader("🎯 Outlier Detection")
+            st.markdown("Identify and analyze outliers in your data")
+            
+            numeric_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            if numeric_cols:
+                col1, col2 = st.columns(2)
+                with col1:
+                    outlier_col = st.selectbox("Select column for outlier detection:", numeric_cols, key="outlier_col")
+                with col2:
+                    method = st.selectbox("Detection method:", ["IQR Method", "Z-Score Method"])
+                
+                if method == "IQR Method":
+                    multiplier = st.slider("IQR multiplier:", 1.0, 3.0, 1.5, 0.1)
+                    result = st.session_state.stat_analyzer.detect_outliers_iqr(current_df[outlier_col], multiplier)
+                else:
+                    threshold = st.slider("Z-score threshold:", 2.0, 4.0, 3.0, 0.1)
+                    result = st.session_state.stat_analyzer.detect_outliers_zscore(current_df[outlier_col], threshold)
+                
+                if 'error' not in result:
+                    # Display metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Outliers", result['n_outliers'])
+                    with col2:
+                        st.metric("Outlier %", f"{result['outlier_percentage']:.2f}%")
+                    with col3:
+                        st.metric("Lower Bound" if method == "IQR Method" else "Mean", 
+                                 f"{result.get('lower_bound', result.get('mean', 0)):.4f}")
+                    with col4:
+                        st.metric("Upper Bound" if method == "IQR Method" else "Std Dev",
+                                 f"{result.get('upper_bound', result.get('std', 0)):.4f}")
+                    
+                    # Visualization
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Box plot with outliers highlighted
+                        fig = px.box(current_df, y=outlier_col, title=f"Box Plot of {outlier_col}")
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        # Histogram with bounds
+                        fig = px.histogram(current_df, x=outlier_col, title=f"Distribution with Outlier Bounds")
+                        if method == "IQR Method":
+                            fig.add_vline(x=result['lower_bound'], line_dash="dash", line_color="red", 
+                                         annotation_text="Lower Bound")
+                            fig.add_vline(x=result['upper_bound'], line_dash="dash", line_color="red",
+                                         annotation_text="Upper Bound")
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Outlier details
+                    if result['n_outliers'] > 0:
+                        with st.expander(f"📋 View {result['n_outliers']} Outlier Values"):
+                            outlier_df = pd.DataFrame({
+                                'Index': result['outlier_indices'][:50],  # Limit display
+                                'Value': result['outlier_values'][:50]
+                            })
+                            st.dataframe(outlier_df, use_container_width=True)
+                            if result['n_outliers'] > 50:
+                                st.caption(f"Showing first 50 of {result['n_outliers']} outliers")
+                else:
+                    st.error(result['error'])
+            else:
+                st.info("No numerical columns available for outlier detection")
+        
+        # =============================================
+        # TAB 6: DATA QUALITY REPORT
+        # =============================================
+        with analytics_tab6:
+            st.subheader("📋 Data Quality Report")
+            st.markdown("Comprehensive data quality assessment and profiling")
+            
+            if st.button("Generate Quality Report", type="primary"):
+                with st.spinner("Analyzing data quality..."):
+                    report = st.session_state.adv_analytics.generate_data_quality_report(current_df)
+                    
+                    # Quality Score Card
+                    st.subheader("📊 Quality Score")
+                    score = report['quality_score']
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Overall Score", f"{score['overall']}/100", delta=f"Grade: {score['grade']}")
+                    with col2:
+                        st.metric("Completeness", f"{score['completeness']:.1f}%")
+                    with col3:
+                        st.metric("Uniqueness", f"{score['uniqueness']:.1f}%")
+                    with col4:
+                        issues = report['issues_summary']
+                        st.metric("Columns with Issues", issues['columns_with_issues'])
+                    
+                    st.markdown("---")
+                    
+                    # Overview
+                    st.subheader("📈 Dataset Overview")
+                    overview = report['overview']
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Rows", f"{overview['total_rows']:,}")
+                    with col2:
+                        st.metric("Total Columns", overview['total_columns'])
+                    with col3:
+                        st.metric("Missing Values", f"{overview['total_missing']:,}")
+                    with col4:
+                        st.metric("Memory Usage", f"{overview['memory_usage_mb']:.2f} MB")
+                    
+                    # Column Types
+                    col_types = report['column_types']
+                    cols = st.columns(4)
+                    with cols[0]:
+                        st.metric("Numeric", col_types['numeric'])
+                    with cols[1]:
+                        st.metric("Categorical", col_types['categorical'])
+                    with cols[2]:
+                        st.metric("Datetime", col_types['datetime'])
+                    with cols[3]:
+                        st.metric("Boolean", col_types['boolean'])
+                    
+                    st.markdown("---")
+                    
+                    # Column Analysis
+                    st.subheader("🔍 Column-Level Analysis")
+                    
+                    col_analysis_df = pd.DataFrame(report['column_analysis'])
+                    col_analysis_df['issues'] = col_analysis_df['issues'].apply(lambda x: ', '.join(x) if x else 'None')
+                    
+                    # Highlight issues
+                    def highlight_issues(row):
+                        if row['has_issues']:
+                            return ['background-color: #ffcccc'] * len(row)
+                        return [''] * len(row)
+                    
+                    styled_df = col_analysis_df.style.apply(highlight_issues, axis=1)
+                    st.dataframe(styled_df, use_container_width=True)
+                    
+                    # Issue Summary
+                    if report['issues_summary']['columns_with_issues'] > 0:
+                        st.warning(f"⚠️ {report['issues_summary']['columns_with_issues']} columns have potential issues")
+                        
+                        with st.expander("📋 Issues Details"):
+                            for col_info in report['column_analysis']:
+                                if col_info['issues']:
+                                    st.write(f"**{col_info['column']}**: {', '.join(col_info['issues'])}")
 
-# Main prediction page logic
-# Main prediction page logic - FIXED VERSION
+
 if page == "prediction":
     st.header("🤖 Automated Regression Modeling")
     st.markdown("Complete regression pipeline with automated model selection and prediction capabilities")
