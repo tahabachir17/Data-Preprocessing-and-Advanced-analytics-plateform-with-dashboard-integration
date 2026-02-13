@@ -1,17 +1,5 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import (
-    mean_squared_error, mean_absolute_error, r2_score
-)
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import ElasticNet, LinearRegression, Ridge, Lasso
-from sklearn.svm import SVR
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.neighbors import KNeighborsRegressor
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.neural_network import MLPRegressor
 import warnings
 import joblib
 import os
@@ -22,7 +10,7 @@ warnings.filterwarnings('ignore')
 
 class MLModels:
     def __init__(self):
-        self.scaler = StandardScaler()
+        self.scaler = None  # Created lazily in scale_numerical_features()
         self.label_encoders = {}  # Store multiple label encoders
         self.best_model = None
         self.best_model_name = None
@@ -69,6 +57,11 @@ class MLModels:
         """
         Scale only numerical features (int and float)
         """
+        from sklearn.preprocessing import StandardScaler
+
+        if self.scaler is None:
+            self.scaler = StandardScaler()
+
         X_scaled = X.copy()
         
         # Identify numerical and categorical features
@@ -102,6 +95,8 @@ class MLModels:
         """
         Encode categorical features using label encoding with error handling
         """
+        from sklearn.preprocessing import LabelEncoder
+
         X_encoded = X.copy()
         
         for col in self.categorical_features:
@@ -233,6 +228,8 @@ class MLModels:
         """
         Split data for regression
         """
+        from sklearn.model_selection import train_test_split
+
         print(f"Splitting data with test_size={test_size}")
         
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
@@ -247,6 +244,9 @@ class MLModels:
         """
         Get regression models with hyperparameter grids for tuning
         """
+        from sklearn.linear_model import LinearRegression, Ridge, Lasso
+        from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
         models = {
             'Linear Regression': {
                 'model': LinearRegression(),
@@ -292,6 +292,8 @@ class MLModels:
         """
         Train all regression models using GridSearchCV and return only the best performing one
         """
+        from sklearn.model_selection import GridSearchCV
+
         models = self.get_regression_models()
         model_scores = {}
         
@@ -363,6 +365,8 @@ class MLModels:
         """
         Comprehensive model evaluation for regression
         """
+        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
         try:
             predictions = model.predict(X_test)
             

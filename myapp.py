@@ -9,19 +9,19 @@ from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import seaborn as sns
-import matplotlib.pyplot as plt
 import base64
 
-# Import your custom classes
+# Import lightweight custom classes (always needed)
 from src.data_processing.cleaner import DataCleaner
 from src.data_processing.loader import DataLoader
 from src.data_processing.transformer import DataTransformer
 from src.visualization.charts import DataVisualizer
 from src.visualization.dashboard import Dashboard
-from src.analytics.ml_models import MLModels
-from src.analytics.statistical import StatisticalAnalyzer
-from src.analytics.advanced_analytics import AdvancedAnalytics
+
+# Heavy analytics modules — imported lazily when their pages are visited
+# from src.analytics.ml_models import MLModels
+# from src.analytics.statistical import StatisticalAnalyzer
+# from src.analytics.advanced_analytics import AdvancedAnalytics
 
 # Configuration du logging pour Streamlit
 logging.basicConfig(
@@ -147,7 +147,7 @@ def initialize_session_state():
         'transformer': DataTransformer(),
         'visualizer': DataVisualizer(),
         'dashboard': None,
-        'ml_models': MLModels(),
+        'ml_models': None,  # Created lazily when prediction page is visited
         'processing_logs': [],
         'plots_history': [],
         'current_plot': None,
@@ -1451,6 +1451,10 @@ elif page == "analytics":
     st.markdown("Statistical analysis, hypothesis testing, and data quality tools")
     st.markdown("---")
     
+    # Lazy imports — only loaded when user visits this page
+    from src.analytics.statistical import StatisticalAnalyzer
+    from src.analytics.advanced_analytics import AdvancedAnalytics
+
     # Initialize analyzers
     if 'stat_analyzer' not in st.session_state:
         st.session_state.stat_analyzer = StatisticalAnalyzer()
@@ -2117,8 +2121,11 @@ if page == "prediction":
     st.info("🎯 This system performs **regression only** - predicting continuous numeric values")
     st.markdown("---")
     
+    # Lazy import — only loaded when user visits this page
+    from src.analytics.ml_models import MLModels
+
     # Initialize ML models if not already done
-    if 'ml_models' not in st.session_state:
+    if 'ml_models' not in st.session_state or st.session_state.ml_models is None:
         st.session_state.ml_models = MLModels()
     
     # Add tabs for Training and Prediction

@@ -2,8 +2,6 @@ import pandas as pd
 import numpy as np
 from typing import Union
 import logging
-from sklearn.preprocessing import LabelEncoder
-import category_encoders as ce
 import re
 
 # Configuration du logging
@@ -48,6 +46,9 @@ class DataTransformer:
         df_encoded = df.copy()
         df_encoded = _standardize_columns(df_encoded)
         cat_cols = df_encoded.select_dtypes(include=['object', 'category']).columns.tolist()
+
+        # Lazy import — only loaded when encoding is actually needed
+        import category_encoders as ce
         
         # Fill target column if provided
         if target_col and target_col in df_encoded.columns:
@@ -139,53 +140,91 @@ class DataTransformer:
         return df_encoded
     
     def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Transform date columns to datetime format"""
+        """
+        Transform date/time columns to datetime format.
+        If a separate time column exists (heure, hour, time), merge it with the
+        date column into a single 'date_time' column.
+        """
         logger.info("Starting data transformation")
         df_transformed = df.copy()
-        date_columns_found = []
-        
-        # Look for date columns with various names
-        date_keywords = ['date', 'datetime', 'timestamp', 'time', 'jour', 'journee']
-        
-        for col in df.columns:
+
+        # --- Step 1: Find the date column ---
+        date_keywords = ['date', 'datetime', 'timestamp', 'jour', 'journee']
+        date_col = None
+        for col in df_transformed.columns:
             if any(keyword in col.lower() for keyword in date_keywords):
                 try:
-                    logger.info(f"Transforming column '{col}' to datetime")
                     df_transformed[col] = pd.to_datetime(df_transformed[col], errors='coerce')
-                    date_columns_found.append(col)
+                    date_col = col
+                    logger.info(f"Converted '{col}' to datetime")
+                    break
                 except Exception as e:
-                    logger.warning(f"Could not convert column '{col}' to datetime: {str(e)}")
-        
-        if date_columns_found:
-            logger.info(f"Successfully transformed {len(date_columns_found)} date columns: {date_columns_found}")
+                    logger.warning(f"Could not convert '{col}' to datetime: {e}")
+
+        if date_col is None:
+            logger.warning("No date column found to transform")
+            return df_transformed
+
+        # --- Step 2: Find the time column (heure / hour / time) ---
+        time_keywords = ['heure', 'hour', 'time']
+        time_col = None
+        for col in df_transformed.columns:
+            if col == date_col:
+                continue
+            if any(keyword in col.lower() for keyword in time_keywords):
+                time_col = col
+                logger.info(f"Found time column: '{col}'")
+                break
+
+        # --- Step 3: Merge date + time into 'date_time' ---
+        if time_col is not None:
+            # Clean the date part (strip any existing 00:00:00)
+            date_part = df_transformed[date_col].dt.date.astype(str)
+
+            # Clean the time part — handles formats like:
+            #   06H00, 6H00, 06h30, 6H, 06:00, 600, 6, etc.
+            def parse_time_value(val):
+                """Convert French time format (06H00) to HH:MM:SS string."""
+                val = str(val).strip()
+
+                # Try regex for patterns like 06H00, 6h30, 06H, etc.
+                match = re.match(r'^(\d{1,2})\s*[Hh:]\s*(\d{0,2})$', val)
+                if match:
+                    hour = int(match.group(1))
+                    minute = int(match.group(2)) if match.group(2) else 0
+                    return f"{hour:02d}:{minute:02d}:00"
+
+                # Try plain integer (e.g. 6, 14, 600, 1430)
+                if val.isdigit():
+                    num = int(val)
+                    if num <= 24:
+                        return f"{num:02d}:00:00"
+                    else:
+                        hour = num // 100
+                        minute = num % 100
+                        return f"{hour:02d}:{minute:02d}:00"
+
+                return val  # return as-is and let pd.to_datetime handle it
+
+            time_part = df_transformed[time_col].apply(parse_time_value)
+
+            # Combine into a single datetime column
+            df_transformed['date_time'] = pd.to_datetime(
+                date_part + ' ' + time_part, errors='coerce'
+            )
+
+            # Drop the original separate date and time columns
+            df_transformed = df_transformed.drop(columns=[date_col, time_col])
+
+            success_count = df_transformed['date_time'].notna().sum()
+            total_count = len(df_transformed)
+            logger.info(
+                f"Merged '{date_col}' + '{time_col}' into 'date_time' "
+                f"({success_count}/{total_count} rows parsed successfully)"
+            )
         else:
-            logger.warning("No date columns found to transform")
-        
+            logger.info(f"No separate time column found. Keeping '{date_col}' as-is.")
 
-        # --- THE TRANSFORMATION LOGIC ---
-
-        # 2. Identify the columns dynamically based on your keywords
-        # We look for columns containing 'date', 'heure', or 'hour'
-        date_col = next((col for col in df.columns if 'date' in col.lower()), None)
-        time_col = next((col for col in df.columns if 'heure' in col.lower() or 'hour' in col.lower()), None)
-
-        if date_col and time_col:
-            # A. Clean the Date: Ensure it is a string in YYYY-MM-DD format
-            # We use .dt.date to strip existing 00:00:00 time info if it exists
-            date_part = pd.to_datetime(df_transformed[date_col]).dt.date.astype(str)
-
-            # B. Clean the Time: Replace the French 'H' with standard ':'
-            # 06H00 becomes 06:00
-            time_part = df_transformed[time_col].astype(str).str.replace('H', ':', case=False).str.strip()
-
-            # C. Merge and Convert to Datetime
-            # We create a new column 'full_datetime'
-            df['full_datetime'] = pd.to_datetime(date_part + ' ' + time_part)
-
-        # 3. View the result
-        print(df[['date_c', 'heure', 'full_datetime']])
-        print("\nNew Column Type:", df['full_datetime'].dtype)
-        
         return df_transformed
     
     def dataframe_grouping(self, df: pd.DataFrame, group_cols: Union[str, list]) -> pd.DataFrame:

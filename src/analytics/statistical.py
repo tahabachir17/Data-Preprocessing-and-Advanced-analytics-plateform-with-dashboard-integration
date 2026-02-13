@@ -6,7 +6,6 @@ Provides comprehensive statistical analysis and hypothesis testing capabilities.
 
 import pandas as pd
 import numpy as np
-from scipy import stats
 from typing import Dict, List, Tuple, Optional, Any
 import warnings
 warnings.filterwarnings('ignore')
@@ -19,6 +18,15 @@ class StatisticalAnalyzer:
     
     def __init__(self):
         self.results_history = []
+        self._stats = None  # Lazy-loaded scipy.stats
+
+    @property
+    def stats(self):
+        """Lazy-load scipy.stats on first access."""
+        if self._stats is None:
+            from scipy import stats
+            self._stats = stats
+        return self._stats
     
     # ==========================================
     # NORMALITY TESTS
@@ -52,7 +60,7 @@ class StatisticalAnalyzer:
         # Shapiro-Wilk Test (best for small samples < 5000)
         if len(clean_data) <= 5000:
             try:
-                stat, p_value = stats.shapiro(clean_data)
+                stat, p_value = self.stats.shapiro(clean_data)
                 results['tests']['shapiro_wilk'] = {
                     'statistic': round(stat, 6),
                     'p_value': round(p_value, 6),
@@ -66,7 +74,7 @@ class StatisticalAnalyzer:
         # D'Agostino-Pearson Test (good for larger samples)
         if len(clean_data) >= 20:
             try:
-                stat, p_value = stats.normaltest(clean_data)
+                stat, p_value = self.stats.normaltest(clean_data)
                 results['tests']['dagostino_pearson'] = {
                     'statistic': round(stat, 6),
                     'p_value': round(p_value, 6),
@@ -79,7 +87,7 @@ class StatisticalAnalyzer:
         
         # Anderson-Darling Test
         try:
-            result = stats.anderson(clean_data, dist='norm')
+            result = self.stats.anderson(clean_data, dist='norm')
             # Use 5% significance level (index 2)
             critical_value = result.critical_values[2]
             is_normal = result.statistic < critical_value
@@ -127,7 +135,7 @@ class StatisticalAnalyzer:
         if len(clean_data) < 2:
             return {'error': 'Insufficient data for t-test'}
         
-        stat, p_value = stats.ttest_1samp(clean_data, population_mean, alternative=alternative)
+        stat, p_value = self.stats.ttest_1samp(clean_data, population_mean, alternative=alternative)
         
         sample_mean = clean_data.mean()
         sample_std = clean_data.std()
@@ -174,7 +182,7 @@ class StatisticalAnalyzer:
         if len(clean_g1) < 2 or len(clean_g2) < 2:
             return {'error': 'Insufficient data in one or both groups'}
         
-        stat, p_value = stats.ttest_ind(clean_g1, clean_g2, equal_var=equal_var, alternative=alternative)
+        stat, p_value = self.stats.ttest_ind(clean_g1, clean_g2, equal_var=equal_var, alternative=alternative)
         
         mean1, mean2 = clean_g1.mean(), clean_g2.mean()
         std1, std2 = clean_g1.std(), clean_g2.std()
@@ -185,7 +193,7 @@ class StatisticalAnalyzer:
         cohens_d = (mean1 - mean2) / pooled_std if pooled_std > 0 else 0
         
         # Levene's test for equal variances
-        levene_stat, levene_p = stats.levene(clean_g1, clean_g2)
+        levene_stat, levene_p = self.stats.levene(clean_g1, clean_g2)
         
         return {
             'test_type': "Student's T-Test" if equal_var else "Welch's T-Test",
@@ -226,7 +234,7 @@ class StatisticalAnalyzer:
         clean_before = combined['before']
         clean_after = combined['after']
         
-        stat, p_value = stats.ttest_rel(clean_before, clean_after, alternative=alternative)
+        stat, p_value = self.stats.ttest_rel(clean_before, clean_after, alternative=alternative)
         
         differences = clean_after - clean_before
         mean_diff = differences.mean()
@@ -281,7 +289,7 @@ class StatisticalAnalyzer:
             return {'error': 'Need at least 2 groups with sufficient data'}
         
         # Perform ANOVA
-        f_stat, p_value = stats.f_oneway(*groups)
+        f_stat, p_value = self.stats.f_oneway(*groups)
         
         # Calculate group statistics
         group_stats = []
@@ -301,7 +309,7 @@ class StatisticalAnalyzer:
         eta_squared = ss_between / ss_total if ss_total > 0 else 0
         
         # Levene's test for homogeneity of variances
-        levene_stat, levene_p = stats.levene(*groups)
+        levene_stat, levene_p = self.stats.levene(*groups)
         
         result = {
             'test_type': 'One-Way ANOVA',
@@ -351,7 +359,7 @@ class StatisticalAnalyzer:
         if contingency_table.shape[0] < 2 or contingency_table.shape[1] < 2:
             return {'error': 'Need at least 2 categories in each variable'}
         
-        chi2, p_value, dof, expected = stats.chi2_contingency(contingency_table)
+        chi2, p_value, dof, expected = self.stats.chi2_contingency(contingency_table)
         
         # Effect size (Cramér's V)
         n = contingency_table.sum().sum()
@@ -390,7 +398,7 @@ class StatisticalAnalyzer:
         if len(obs_counts) != len(expected):
             return {'error': 'Observed and expected frequencies must have same length'}
         
-        chi2, p_value = stats.chisquare(obs_counts.values, f_exp=expected)
+        chi2, p_value = self.stats.chisquare(obs_counts.values, f_exp=expected)
         
         return {
             'test_type': 'Chi-Square Goodness-of-Fit Test',
@@ -421,7 +429,7 @@ class StatisticalAnalyzer:
         if len(clean_g1) < 2 or len(clean_g2) < 2:
             return {'error': 'Insufficient data in one or both groups'}
         
-        stat, p_value = stats.mannwhitneyu(clean_g1, clean_g2, alternative=alternative)
+        stat, p_value = self.stats.mannwhitneyu(clean_g1, clean_g2, alternative=alternative)
         
         # Effect size (rank-biserial correlation)
         n1, n2 = len(clean_g1), len(clean_g2)
@@ -461,7 +469,7 @@ class StatisticalAnalyzer:
         if len(differences) < 2:
             return {'error': 'Insufficient non-zero differences'}
         
-        stat, p_value = stats.wilcoxon(differences, alternative=alternative)
+        stat, p_value = self.stats.wilcoxon(differences, alternative=alternative)
         
         return {
             'test_type': 'Wilcoxon Signed-Rank Test',
@@ -492,7 +500,7 @@ class StatisticalAnalyzer:
         if len(groups) < 2:
             return {'error': 'Need at least 2 groups with sufficient data'}
         
-        h_stat, p_value = stats.kruskal(*groups)
+        h_stat, p_value = self.stats.kruskal(*groups)
         
         # Group statistics
         group_stats = []
@@ -622,8 +630,8 @@ class StatisticalAnalyzer:
         """
         clean_data = data.dropna()
         
-        skewness = stats.skew(clean_data)
-        kurtosis = stats.kurtosis(clean_data)
+        skewness = self.stats.skew(clean_data)
+        kurtosis = self.stats.kurtosis(clean_data)
         
         # Skewness interpretation
         if abs(skewness) < 0.5:
