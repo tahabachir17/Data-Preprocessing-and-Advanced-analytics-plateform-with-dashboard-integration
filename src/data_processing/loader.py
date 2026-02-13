@@ -41,28 +41,32 @@ class DataLoader:
 
         return df
 
-    def loader(self,filepath):
-        if filepath.endswith('.csv'):
-            preview_cols = pd.read_csv(filepath, nrows=0).columns
-            index_col = 0 if 'Unnamed: 0' in preview_cols else None
-        
-            df = pd.read_csv(filepath, index_col=index_col)
-            mask = self.find_keyword_rows(df, ['date', 'timestamp', 'datetime', 'time', 'jour', 'journee', 'annee', 'year', 'mois', 'month', 'semaine', 'week'])
+    def loader(self, filepath):
+        keywords = ['date', 'timestamp', 'datetime', 'time', 'jour', 'journee', 'annee', 'year', 'mois', 'month', 'semaine', 'week']
 
-            if mask:  # if at least one match was found
+        if filepath.endswith('.csv'):
+            # Single read — detect index column from the columns of this read
+            df = pd.read_csv(filepath)
+            index_col = 0 if 'Unnamed: 0' in df.columns else None
+            if index_col is not None:
+                df = df.set_index(df.columns[0])
+
+            # Search for a header row only in the first 20 rows (fast)
+            mask = self.find_keyword_rows(df.head(20), keywords)
+            if mask:
+                # Only re-read when we actually need a different header row
                 df = pd.read_csv(filepath, header=mask[0], index_col=index_col)
-        
+
         elif filepath.endswith('.xlsx'):
             df = pd.read_excel(filepath)
-            mask = self.find_keyword_rows(df, ['date', 'timestamp', 'datetime', 'time', 'jour', 'journee', 'annee', 'year', 'mois', 'month', 'semaine', 'week'])
 
+            mask = self.find_keyword_rows(df.head(20), keywords)
             if mask:
                 df = pd.read_excel(filepath, header=mask[0] + 1)
 
         else:
             raise ValueError("Unsupported file format. Please use .csv or .xlsx files.")
-        
-        df = df.loc[:, ~df.columns.str.lower().str.contains('unnamed')]
 
+        df = df.loc[:, ~df.columns.str.lower().str.contains('unnamed')]
 
         return df

@@ -161,6 +161,31 @@ class DataTransformer:
         else:
             logger.warning("No date columns found to transform")
         
+
+        # --- THE TRANSFORMATION LOGIC ---
+
+        # 2. Identify the columns dynamically based on your keywords
+        # We look for columns containing 'date', 'heure', or 'hour'
+        date_col = next((col for col in df.columns if 'date' in col.lower()), None)
+        time_col = next((col for col in df.columns if 'heure' in col.lower() or 'hour' in col.lower()), None)
+
+        if date_col and time_col:
+            # A. Clean the Date: Ensure it is a string in YYYY-MM-DD format
+            # We use .dt.date to strip existing 00:00:00 time info if it exists
+            date_part = pd.to_datetime(df_transformed[date_col]).dt.date.astype(str)
+
+            # B. Clean the Time: Replace the French 'H' with standard ':'
+            # 06H00 becomes 06:00
+            time_part = df_transformed[time_col].astype(str).str.replace('H', ':', case=False).str.strip()
+
+            # C. Merge and Convert to Datetime
+            # We create a new column 'full_datetime'
+            df['full_datetime'] = pd.to_datetime(date_part + ' ' + time_part)
+
+        # 3. View the result
+        print(df[['date_c', 'heure', 'full_datetime']])
+        print("\nNew Column Type:", df['full_datetime'].dtype)
+        
         return df_transformed
     
     def dataframe_grouping(self, df: pd.DataFrame, group_cols: Union[str, list]) -> pd.DataFrame:
