@@ -1,0 +1,101 @@
+# ===========================================================
+# CI Pipeline — Lint, Test, Security
+# ===========================================================
+# Triggered on push/PR to main and develop branches.
+# ===========================================================
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────
+  # Lint & Format Check
+  # ─────────────────────────────────────────────────
+  lint:
+    name: 🔍 Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff black
+
+      - name: Run Ruff linter
+        run: ruff check src/ myapp.py --output-format=github
+
+      - name: Check Black formatting
+        run: black --check --diff src/ myapp.py
+
+  # ─────────────────────────────────────────────────
+  # Unit Tests with Coverage
+  # ─────────────────────────────────────────────────
+  test:
+    name: 🧪 Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=60
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ─────────────────────────────────────────────────
+  # Security Audit
+  # ─────────────────────────────────────────────────
+  security:
+    name: 🔒 Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pip-audit
+
+      - name: Run pip-audit
+        run: pip-audit --strict --desc

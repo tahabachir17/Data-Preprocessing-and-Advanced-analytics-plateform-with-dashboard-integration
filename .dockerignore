@@ -1,0 +1,52 @@
+# Git
+.git
+.gitignore
+
+# CI/CD
+.github/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Tests & Coverage
+tests/
+htmlcov/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+
+# Data files
+data/
+*.csv
+*.xlsx
+*.parquet
+
+# Logs
+logs/
+*.log
+
+# Documentation
+*.md
+LICENSE
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ML artifacts (models should be pre-built or fetched at runtime)
+models/
+*.pkl
+*.joblib

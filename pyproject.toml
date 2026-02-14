@@ -1,0 +1,90 @@
+# ===========================================================
+# DataFlow Pro — Project Configuration
+# ===========================================================
+
+[project]
+name = "dataflow-pro"
+version = "1.0.0"
+description = "Advanced Data Preprocessing & Analytics Platform"
+requires-python = ">=3.9"
+
+# ── Ruff (Linter) ──────────────────────────────────
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort (import sorting)
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # Ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "SIM108", # use ternary operator (readability preference)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # allow assert in tests
+"myapp.py" = ["E402"]  # allow late imports in Streamlit app
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "config"]
+
+# ── Black (Formatter) ─────────────────────────────
+[tool.black]
+target-version = ["py39"]
+line-length = 120
+
+# ── Pytest ────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "-ra",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks integration tests",
+]
+
+# ── Coverage ──────────────────────────────────────
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "tests/*",
+    "config/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 60
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if __name__ == .__main__.",
+    "raise NotImplementedError",
+    "pass",
+]
+
+# ── Mypy (Type Checking) ─────────────────────────
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+check_untyped_defs = true
