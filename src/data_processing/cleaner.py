@@ -93,6 +93,90 @@ class DataCleaner:
             
         return True
 
+    def _merge_datetime_and_time_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Detect datetime and time columns, merge them into a single 'date_time' column.
+        Time column is identified by keywords: heure, hour, time.
+        Handles French-format time values like 06H00, 07H00, 6H, 06:00, 600, etc.
+        """
+        import re as _re
+
+        # --- Step 1: Find the date column ---
+        date_keywords = ['date', 'datetime', 'timestamp', 'jour', 'journee']
+        date_col = None
+        for col in df.columns:
+            if any(keyword in col.lower() for keyword in date_keywords):
+                try:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                    if df[col].notna().any():  # Only accept if at least some values parsed
+                        date_col = col
+                        print(f"   📅 Found date column: '{col}'")
+                        break
+                except Exception:
+                    pass
+
+        if date_col is None:
+            print("   ⚠️ No date column found — skipping datetime-time merge")
+            return df
+
+        # --- Step 2: Find the time column (heure / hour / time) ---
+        time_keywords = ['heure', 'hour', 'time']
+        time_col = None
+        for col in df.columns:
+            if col == date_col:
+                continue
+            if any(keyword in col.lower() for keyword in time_keywords):
+                time_col = col
+                print(f"   ⏰ Found time column: '{col}'")
+                break
+
+        if time_col is None:
+            print(f"   ℹ️ No separate time column found — keeping '{date_col}' as-is")
+            return df
+
+        # --- Step 3: Parse time values and merge ---
+        def parse_time_value(val):
+            """Convert French time format (06H00) to HH:MM:SS string."""
+            val = str(val).strip()
+
+            # Try regex for patterns like 06H00, 6h30, 06H, etc.
+            match = _re.match(r'^(\d{1,2})\s*[Hh:]\s*(\d{0,2})$', val)
+            if match:
+                hour = int(match.group(1))
+                minute = int(match.group(2)) if match.group(2) else 0
+                return f"{hour:02d}:{minute:02d}:00"
+
+            # Try plain integer (e.g. 6, 14, 600, 1430)
+            if val.isdigit():
+                num = int(val)
+                if num <= 24:
+                    return f"{num:02d}:00:00"
+                else:
+                    hour = num // 100
+                    minute = num % 100
+                    return f"{hour:02d}:{minute:02d}:00"
+
+            return val  # return as-is and let pd.to_datetime handle it
+
+        # Clean date part (strip any existing 00:00:00)
+        date_part = df[date_col].dt.date.astype(str)
+        time_part = df[time_col].apply(parse_time_value)
+
+        # Combine into a single datetime column
+        df['date_time'] = pd.to_datetime(
+            date_part + ' ' + time_part, errors='coerce'
+        )
+
+        # Drop the original separate date and time columns
+        df = df.drop(columns=[date_col, time_col])
+
+        success_count = df['date_time'].notna().sum()
+        total_count = len(df)
+        print(f"   ✅ Merged '{date_col}' + '{time_col}' → 'date_time' "
+              f"({success_count}/{total_count} rows parsed successfully)")
+
+        return df
+
     def _optimize_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
         """Optimize data types for memory efficiency - FIXED VERSION"""
         print("Optimizing data types...")
@@ -497,10 +581,14 @@ class DataCleaner:
         # Step 2: Standardize columns
         df_cleaned = self._standardize_columns(df_cleaned)
         
-        # Step 3: Optimize data types
+        # Step 3: Merge datetime + time columns (e.g. date_c + heure → date_time)
+        print("\n🔗 Checking for datetime + time column merge...")
+        df_cleaned = self._merge_datetime_and_time_columns(df_cleaned)
+        
+        # Step 4: Optimize data types
         df_cleaned = self._optimize_dtypes(df_cleaned)
         
-        # Step 4: Handle missing values with frequency parameter
+        # Step 5: Handle missing values with frequency parameter
         df_cleaned = self._handle_missing_values(df_cleaned, data_type, frequency_lines)
 
         # Final verification

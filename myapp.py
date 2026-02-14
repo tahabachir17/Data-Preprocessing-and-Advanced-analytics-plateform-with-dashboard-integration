@@ -747,7 +747,7 @@ if page == "data_pipeline":
                 with st.expander("Column Information", expanded=False):
                     col_info = pd.DataFrame({
                         'Column': df.columns,
-                        'Data Type': df.dtypes,
+                        'Data Type': df.dtypes.astype(str),
                         'Non-Null Count': df.count(),
                         'Null Count': df.isnull().sum(),
                         'Unique Values': [df[col].nunique() for col in df.columns]
