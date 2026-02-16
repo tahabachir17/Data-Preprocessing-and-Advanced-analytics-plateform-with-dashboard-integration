@@ -65,8 +65,8 @@ class MLModels:
         X_scaled = X.copy()
         
         # Identify numerical and categorical features
-        self.numerical_features = X.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
-        self.categorical_features = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        self.numerical_features = X.select_dtypes(include=[np.number, 'bool']).columns.tolist()
+        self.categorical_features = X.select_dtypes(exclude=[np.number, 'bool']).columns.tolist()
         
         print(f"Numerical features to scale ({len(self.numerical_features)}): {self.numerical_features}")
         print(f"Categorical features ({len(self.categorical_features)}): {self.categorical_features}")
@@ -217,6 +217,16 @@ class MLModels:
             print("Warning: Infinite values still present, replacing with zeros")
             X_final = X_final.replace([np.inf, -np.inf], 0)
         
+        # Final safety: convert ALL columns to numeric (catches bool, object leftovers)
+        for col in X_final.columns:
+            if not np.issubdtype(X_final[col].dtype, np.number):
+                try:
+                    X_final[col] = pd.to_numeric(X_final[col], errors='coerce').fillna(0)
+                    print(f"Safety-converted non-numeric column '{col}' to numeric")
+                except Exception:
+                    print(f"Warning: Dropping unconvertible column '{col}'")
+                    X_final = X_final.drop(columns=[col])
+        
         # Store final feature names
         self.feature_names = X_final.columns.tolist()
         print(f"Final feature count: {len(self.feature_names)}")
@@ -323,7 +333,10 @@ class MLModels:
                     verbose=1
                 )
                 
-                grid_search.fit(X_train, y_train)
+                # Ensure numpy float64 to avoid sklearn dtype issues
+                X_train_array = X_train.values.astype(np.float64)
+                y_train_array = y_train.values.astype(np.float64) if hasattr(y_train, 'values') else np.array(y_train, dtype=np.float64)
+                grid_search.fit(X_train_array, y_train_array)
                 
                 best_cv_score = grid_search.best_score_
                 best_params = grid_search.best_params_
@@ -343,7 +356,9 @@ class MLModels:
                 print(f"{name}: Best R² = {best_cv_score:.4f} with params {best_params} ✓")
                 
             except Exception as e:
+                import traceback
                 print(f"Error training {name}: {str(e)}")
+                print(traceback.format_exc())
                 continue
         
         print(f"Successfully trained {successful_models} out of {len(models)} models")
