@@ -1634,9 +1634,13 @@ elif page == "analytics":
                             if 'error' not in test_result:
                                 with [col1, col2, col3][i % 3]:
                                     is_normal = test_result.get('is_normal', False)
+                                    if 'p_value' in test_result:
+                                        display_val = f"p = {test_result['p_value']:.4f}"
+                                    else:
+                                        display_val = f"stat = {test_result['statistic']:.4f}"
                                     st.metric(
                                         test_name.replace('_', ' ').title(),
-                                        f"p = {test_result['p_value']:.4f}",
+                                        display_val,
                                         delta="Normal" if is_normal else "Not Normal",
                                         delta_color="normal" if is_normal else "inverse"
                                     )
@@ -2115,7 +2119,7 @@ elif page == "analytics":
                                     st.write(f"**{col_info['column']}**: {', '.join(col_info['issues'])}")
 
 
-if page == "prediction":
+elif page == "prediction":
     st.header("🤖 Automated Regression Modeling")
     st.markdown("Complete regression pipeline with automated model selection and prediction capabilities")
     st.info("🎯 This system performs **regression only** - predicting continuous numeric values")
