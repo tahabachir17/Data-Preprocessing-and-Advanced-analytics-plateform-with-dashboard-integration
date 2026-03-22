@@ -538,6 +538,24 @@ class MLModels:
             # Prepare the new data using the same pipeline
             X_new = new_df.copy()
             
+            # Remove target column if present in new data
+            if self.target_column and self.target_column in X_new.columns:
+                print(f"Removing target column '{self.target_column}' from prediction data")
+                X_new = X_new.drop(columns=[self.target_column])
+            
+            # Remove features that were removed during training
+            for col in self.removed_features:
+                if col in X_new.columns:
+                    X_new = X_new.drop(columns=[col])
+            
+            # Drop any extra columns not in the expected feature set
+            # (keeps only columns that are in feature_names, numerical_features, or categorical_features)
+            expected_cols = set(self.feature_names) | set(self.numerical_features) | set(self.categorical_features)
+            extra_cols = [col for col in X_new.columns if col not in expected_cols]
+            if extra_cols:
+                print(f"Dropping {len(extra_cols)} extra columns not used during training: {extra_cols}")
+                X_new = X_new.drop(columns=extra_cols)
+            
             # Handle missing values for numerical features
             for col in self.numerical_features:
                 if col in X_new.columns:
@@ -546,11 +564,22 @@ class MLModels:
                     if np.isinf(X_new[col]).any():
                         X_new[col] = X_new[col].replace([np.inf, -np.inf], X_new[col].median())
             
-            # Scale numerical features
-            if self.numerical_features:
-                available_numeric = [col for col in self.numerical_features if col in X_new.columns]
+            # Scale numerical features using only the features the scaler was fitted on
+            if self.scaler is not None and self.numerical_features:
+                # Get the feature names the scaler was fitted on
+                scaler_features = list(self.scaler.feature_names_in_) if hasattr(self.scaler, 'feature_names_in_') else self.numerical_features
+                # Only transform columns that exist in both the new data and the scaler
+                available_numeric = [col for col in scaler_features if col in X_new.columns]
                 if available_numeric:
-                    X_new[available_numeric] = self.scaler.transform(X_new[available_numeric])
+                    # Build a DataFrame with all scaler features, filling missing ones with 0
+                    scaler_df = pd.DataFrame(0, index=X_new.index, columns=scaler_features)
+                    for col in available_numeric:
+                        scaler_df[col] = X_new[col]
+                    scaled_values = self.scaler.transform(scaler_df)
+                    scaled_df = pd.DataFrame(scaled_values, index=X_new.index, columns=scaler_features)
+                    # Only copy back columns that exist in X_new
+                    for col in available_numeric:
+                        X_new[col] = scaled_df[col]
             
             # Encode categorical features
             for col in self.categorical_features:
@@ -577,11 +606,6 @@ class MLModels:
                         # Drop problematic columns
                         X_new = X_new.drop(columns=[col])
             
-            # Remove features that were removed during training
-            for col in self.removed_features:
-                if col in X_new.columns:
-                    X_new = X_new.drop(columns=[col])
-            
             # Ensure we have all the features the model expects
             missing_features = []
             for feature in self.feature_names:
@@ -592,7 +616,7 @@ class MLModels:
             if missing_features:
                 print(f"Warning: Missing features filled with zeros: {missing_features}")
             
-            # Reorder columns to match training data
+            # Reorder columns to match training data (and drop any extras)
             X_new = X_new[self.feature_names]
             
             # Handle any remaining issues
@@ -603,13 +627,15 @@ class MLModels:
                 X_new = X_new.replace([np.inf, -np.inf], 0)
             
             # Make predictions
-            predictions = self.best_model.predict(X_new)
+            predictions = self.best_model.predict(X_new.values.astype(np.float64))
             
             print(f"Predictions completed for {len(predictions)} samples")
             return predictions
             
         except Exception as e:
             print(f"Error making predictions: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def full_regression_pipeline(self, df, target_column, correlation_threshold=0.01, 

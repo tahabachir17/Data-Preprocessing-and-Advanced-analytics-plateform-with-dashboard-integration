@@ -301,10 +301,17 @@ class AdvancedAnalytics:
         # Basic stats
         basic_stats = numeric_df.describe()
         
+        # Safely compute mode — can fail if all values are unique or column is all NaN
+        try:
+            mode_result = numeric_df.mode()
+            mode_values = mode_result.iloc[0] if not mode_result.empty else pd.Series(np.nan, index=numeric_df.columns)
+        except Exception:
+            mode_values = pd.Series(np.nan, index=numeric_df.columns)
+        
         # Additional stats
         additional_stats = pd.DataFrame({
             'median': numeric_df.median(),
-            'mode': numeric_df.mode().iloc[0] if not numeric_df.mode().empty else None,
+            'mode': mode_values,
             'variance': numeric_df.var(),
             'skewness': numeric_df.skew(),
             'kurtosis': numeric_df.kurtosis(),

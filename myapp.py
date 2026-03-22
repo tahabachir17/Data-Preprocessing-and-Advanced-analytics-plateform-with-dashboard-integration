@@ -1586,8 +1586,16 @@ elif page == "analytics":
                     if 'error' not in multi_result:
                         st.write(f"**High correlation pairs found:** {multi_result['n_high_correlations']}")
                         st.write(f"**Recommendation:** {multi_result['recommendation']}")
+                        
+                        # Show the high correlation pairs table
+                        if multi_result['high_correlation_pairs']:
+                            pairs_df = pd.DataFrame(multi_result['high_correlation_pairs'])
+                            st.dataframe(pairs_df, use_container_width=True)
+                        
                         if multi_result['potentially_redundant_features']:
                             st.warning(f"Potentially redundant features: {', '.join(multi_result['potentially_redundant_features'])}")
+                    else:
+                        st.error(multi_result['error'])
             else:
                 st.info("No numerical columns available for correlation analysis")
         
@@ -2013,7 +2021,7 @@ elif page == "analytics":
                     with col1:
                         # Box plot with outliers highlighted
                         fig = px.box(current_df, y=outlier_col, title=f"Box Plot of {outlier_col}")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="outlier_box_plot")
                     
                     with col2:
                         # Histogram with bounds
@@ -2023,7 +2031,7 @@ elif page == "analytics":
                                          annotation_text="Lower Bound")
                             fig.add_vline(x=result['upper_bound'], line_dash="dash", line_color="red",
                                          annotation_text="Upper Bound")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="outlier_hist_plot")
                     
                     # Outlier details
                     if result['n_outliers'] > 0:
@@ -2567,6 +2575,7 @@ elif page == "prediction":
                         st.success(f"✅ Model loaded: {st.session_state.ml_models.best_model_name}")
                         st.write(f"**Target:** {st.session_state.ml_models.target_column}")
                         st.write(f"**Best R²:** {st.session_state.ml_models.best_score:.4f}")
+                        st.write(f"**Features:** {len(st.session_state.ml_models.feature_names)}")
                         st.session_state.model_loaded = True
                     else:
                         st.error("❌ Failed to load model bundle.")
@@ -2608,44 +2617,70 @@ elif page == "prediction":
                         predictions = st.session_state.ml_models.predict_new_data(st.session_state.new_prediction_df)
                         
                         if predictions is not None:
-                            # Add predictions to dataframe
+                            # Add predictions to the ORIGINAL dataframe (including target if present)
                             result_df = st.session_state.new_prediction_df.copy()
                             target_col = st.session_state.ml_models.target_column
                             prediction_col = f"Predicted_{target_col}"
                             result_df[prediction_col] = predictions
                             
+                            # Store in session state so results survive reruns
+                            st.session_state.prediction_result_df = result_df
+                            st.session_state.prediction_col_name = prediction_col
+                            st.session_state.prediction_target_col = target_col
+                            
                             st.success("✅ Predictions generated successfully!")
-                            
-                            # Show results
-                            st.subheader("📊 Prediction Results")
-                            st.dataframe(result_df.head(10), use_container_width=True)
-                            
-                            # Download results
-                            csv = result_df.to_csv(index=False)
-                            st.download_button(
-                                label="📥 Download Predictions (CSV)",
-                                data=csv,
-                                file_name=f"predictions_{target_col}.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            )
-                            
-                            # Visualization of predictions distribution
-                            st.subheader("📈 Predictions Distribution")
-                            fig = px.histogram(
-                                result_df, 
-                                x=prediction_col,
-                                title=f"Distribution of Predicted {target_col}",
-                                marginal="box"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.error("❌ Failed to generate predictions. Check the logs for details.")
                             
                     except Exception as e:
                         st.error(f"Error generating predictions: {str(e)}")
-        elif not st.session_state.get('model_loaded') and not st.session_state.get('new_prediction_df'):
-             st.info("👈 Upload both a model and a dataset to start.")
-                
-                
+                        st.exception(e)
+        elif not st.session_state.get('model_loaded') or st.session_state.get('new_prediction_df') is None:
+            st.info("👈 Upload both a model and a dataset to start.")
+        
+        # Display prediction results (persisted in session state)
+        if st.session_state.get('prediction_result_df') is not None:
+            result_df = st.session_state.prediction_result_df
+            prediction_col = st.session_state.get('prediction_col_name', 'Predictions')
+            target_col = st.session_state.get('prediction_target_col', 'target')
+            
+            st.subheader("📊 Prediction Results")
+            
+            # Show prediction statistics
+            pred_values = result_df[prediction_col]
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Predictions Made", len(pred_values))
+            with col2:
+                st.metric("Mean Prediction", f"{pred_values.mean():.4f}")
+            with col3:
+                st.metric("Min Prediction", f"{pred_values.min():.4f}")
+            with col4:
+                st.metric("Max Prediction", f"{pred_values.max():.4f}")
+            
+            # Show results table
+            st.dataframe(result_df, use_container_width=True)
+            
+            # Download results as CSV
+            csv = result_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Predictions (CSV)",
+                data=csv,
+                file_name=f"predictions_{target_col}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+            
+            # Visualization of predictions distribution
+            st.subheader("📈 Predictions Distribution")
+            fig = px.histogram(
+                result_df, 
+                x=prediction_col,
+                title=f"Distribution of Predicted {target_col}",
+                marginal="box"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
 
 
 

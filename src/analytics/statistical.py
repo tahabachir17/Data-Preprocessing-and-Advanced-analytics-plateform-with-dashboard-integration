@@ -630,8 +630,8 @@ class StatisticalAnalyzer:
         """
         clean_data = data.dropna()
         
-        skewness = self.stats.skew(clean_data)
-        kurtosis = self.stats.kurtosis(clean_data)
+        skewness = float(self.stats.skew(clean_data))
+        kurtosis = float(self.stats.kurtosis(clean_data))
         
         # Skewness interpretation
         if abs(skewness) < 0.5:
