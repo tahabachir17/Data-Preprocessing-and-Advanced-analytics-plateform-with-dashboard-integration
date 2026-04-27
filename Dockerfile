@@ -1,66 +1,42 @@
-# ===========================================================
-# DataFlow Pro — Dockerfile
-# ===========================================================
-# Build:  docker build -t dataflow-pro .
-# Run:    docker run -p 8501:8501 dataflow-pro
-# ===========================================================
+FROM python:3.11-slim
 
-# ── Stage 1: Base image ────────────────────────────
-FROM python:3.11-slim AS base
-
-# Prevent Python from writing .pyc files and enable unbuffered output
+# Keep Python output predictable in containers and configure Streamlit for headless use.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 WORKDIR /app
 
-# ── Stage 2: Install dependencies ──────────────────
-FROM base AS deps
+# Install only the minimal OS packages required by common scientific Python wheels.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install system-level build dependencies (needed by some pip packages)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc g++ && \
-    rm -rf /var/lib/apt/lists/*
+# Copy dependency manifests first to maximize Docker layer cache reuse.
+COPY requirements.txt requirements.txt
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip \
+    && pip install -r requirements.txt
 
-# ── Stage 3: Application ──────────────────────────
-FROM base AS app
+# Create a dedicated unprivileged user before copying the application.
+RUN groupadd --system appuser \
+    && useradd --system --gid appuser --create-home --home-dir /home/appuser appuser
 
-# Copy only the installed packages from deps stage
-COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=deps /usr/local/bin /usr/local/bin
+# Copy only the application assets needed at runtime.
+COPY --chown=appuser:appuser config ./config
+COPY --chown=appuser:appuser src ./src
+COPY --chown=appuser:appuser myapp.py ./myapp.py
 
-# Copy application code
-COPY config/ ./config/
-COPY src/ ./src/
-COPY myapp.py .
-
-# Create required directories
-RUN mkdir -p data logs
-
-# Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser && \
-    chown -R appuser:appuser /app
 USER appuser
-
-# Streamlit configuration
-RUN mkdir -p /home/appuser/.streamlit
-RUN echo '[server]\n\
-headless = true\n\
-port = 8501\n\
-address = "0.0.0.0"\n\
-enableCORS = false\n\
-enableXsrfProtection = false\n\
-\n\
-[browser]\n\
-gatherUsageStats = false\n' > /home/appuser/.streamlit/config.toml
 
 EXPOSE 8501
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+# Use Python for the health check so we do not need curl in the final image.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"
 
-ENTRYPOINT ["streamlit", "run", "myapp.py"]
+CMD ["streamlit", "run", "myapp.py"]

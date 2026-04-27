@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  streamlit-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dashboard-platform:latest
+    container_name: dashboard-platform
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    environment:
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_HEADLESS: "true"
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped

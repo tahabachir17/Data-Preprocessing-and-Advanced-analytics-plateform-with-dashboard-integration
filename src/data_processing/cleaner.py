@@ -4,6 +4,8 @@ import re
 from datetime import datetime, timedelta
 import logging
 
+from src.utils.dataframe_utils import standardize_columns
+
 
 class DataCleaner:
     
@@ -25,20 +27,7 @@ class DataCleaner:
     def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Standardize column names"""
         print("Standardizing column names...")
-        df.columns = [
-            '_'.join(filter(None, str(col).strip().lower()
-                .replace(' ', '_')
-                .replace('.', '')
-                .replace('%', '')
-                .replace('(', '')
-                .replace(')', '')
-                .replace('[', '')
-                .replace(']', '')
-                .replace('/', '_')
-                .replace('\\', '_')
-                .split('_')))
-            for col in df.columns
-        ]
+        df = standardize_columns(df)
         print(f"New column names: {df.columns.tolist()}")
         return df
 

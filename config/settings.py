@@ -6,6 +6,7 @@ All constants, feature flags, and tunable parameters live here.
 """
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 # ───────────────────────────────────────────────────
@@ -80,3 +81,26 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE = LOGS_DIR / "app.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB per log file
 LOG_BACKUP_COUNT = 3               # keep 3 rotated copies
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    """Typed application settings for runtime dependency injection."""
+
+    base_dir: Path = BASE_DIR
+    data_dir: Path = DATA_DIR
+    logs_dir: Path = LOGS_DIR
+    env: str = ENV
+    debug: bool = DEBUG
+    max_upload_size_mb: int = MAX_UPLOAD_SIZE_MB
+    numeric_conversion_threshold: float = NUMERIC_CONVERSION_THRESHOLD
+    ml_test_size: float = ML_TEST_SIZE
+    ml_cv_folds: int = ML_CV_FOLDS
+    ml_random_state: int = ML_RANDOM_STATE
+    log_level: str = LOG_LEVEL
+    log_file: Path = LOG_FILE
+
+
+def get_settings() -> AppSettings:
+    """Return typed settings while keeping backward-compatible module constants."""
+    return AppSettings()

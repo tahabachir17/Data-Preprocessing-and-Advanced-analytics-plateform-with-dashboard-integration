@@ -6,6 +6,9 @@ import os
 import zipfile
 import shutil
 import tempfile
+
+from config.settings import ML_CV_FOLDS, ML_RANDOM_STATE
+
 warnings.filterwarnings('ignore')
 
 class MLModels:
@@ -29,6 +32,7 @@ class MLModels:
         self.encoders_save_path = "regression_encoders.pkl"
         self.metadata_save_path = "model_metadata.pkl"
         self.zip_save_path = "regression_model_bundle.zip"
+        self.n_jobs = max(1, int(os.getenv("ML_N_JOBS", "1")))
         
     def get_available_targets(self, df):
         """
@@ -234,7 +238,7 @@ class MLModels:
         
         return X_final, y
     
-    def split_data(self, X, y, test_size=0.2, random_state=42):
+    def split_data(self, X, y, test_size=0.2, random_state=ML_RANDOM_STATE):
         """
         Split data for regression
         """
@@ -298,7 +302,7 @@ class MLModels:
         }
         return models
     
-    def train_and_select_best_model(self, X_train, y_train, cv_folds=5):
+    def train_and_select_best_model(self, X_train, y_train, cv_folds=ML_CV_FOLDS):
         """
         Train all regression models using GridSearchCV and return only the best performing one
         """
@@ -329,14 +333,13 @@ class MLModels:
                     param_grid=params,
                     cv=cv_folds,
                     scoring='r2',
-                    n_jobs=-1,  # Use all available cores
+                    n_jobs=self.n_jobs,
                     verbose=1
                 )
                 
-                # Ensure numpy float64 to avoid sklearn dtype issues
-                X_train_array = X_train.values.astype(np.float64)
+                X_train_frame = X_train.astype(np.float64)
                 y_train_array = y_train.values.astype(np.float64) if hasattr(y_train, 'values') else np.array(y_train, dtype=np.float64)
-                grid_search.fit(X_train_array, y_train_array)
+                grid_search.fit(X_train_frame, y_train_array)
                 
                 best_cv_score = grid_search.best_score_
                 best_params = grid_search.best_params_
@@ -627,7 +630,7 @@ class MLModels:
                 X_new = X_new.replace([np.inf, -np.inf], 0)
             
             # Make predictions
-            predictions = self.best_model.predict(X_new.values.astype(np.float64))
+            predictions = self.best_model.predict(X_new.astype(np.float64))
             
             print(f"Predictions completed for {len(predictions)} samples")
             return predictions
