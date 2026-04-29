@@ -48,6 +48,35 @@ class TestDataLoader:
         assert isinstance(df, pd.DataFrame)
         assert len(df) > 0
 
+    def test_load_xlsm_basic(self, sample_xlsm_file):
+        """Should load an XLSM file and return a DataFrame."""
+        df = self.loader.loader(sample_xlsm_file)
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) > 0
+
+    def test_get_excel_sheet_names(self, sample_multisheet_excel_file):
+        """Should detect all available sheets in a workbook."""
+        sheet_names = self.loader.get_excel_sheet_names(sample_multisheet_excel_file)
+        assert sheet_names == ["people", "metrics"]
+
+    def test_load_excel_all_sheets(self, sample_multisheet_excel_file):
+        """Should load every Excel sheet into a dictionary of DataFrames."""
+        data = self.loader.load_data(sample_multisheet_excel_file, load_all_sheets=True)
+        assert isinstance(data, dict)
+        assert set(data.keys()) == {"people", "metrics"}
+        assert all(isinstance(df, pd.DataFrame) for df in data.values())
+
+    def test_load_excel_selected_sheets(self, sample_multisheet_excel_file):
+        """Should load only the requested Excel sheets."""
+        data = self.loader.load_data(sample_multisheet_excel_file, sheet_name=["metrics"])
+        assert isinstance(data, dict)
+        assert list(data.keys()) == ["metrics"]
+
+    def test_load_excel_missing_sheet_raises(self, sample_multisheet_excel_file):
+        """Should raise a helpful error when a requested sheet is absent."""
+        with pytest.raises(ValueError, match="Sheet 'unknown' not found"):
+            self.loader.load_data(sample_multisheet_excel_file, sheet_name="unknown")
+
     # ── Error Handling ─────────────────────────────────
 
     def test_unsupported_format_raises(self):
@@ -108,3 +137,23 @@ class TestDataLoader:
         })
         result = self.loader._convert_object_columns_to_numeric(df.copy())
         assert result["names"].dtype == object
+
+    def test_load_batch_mixed_file_types(
+        self,
+        sample_csv_file,
+        sample_multisheet_excel_file,
+    ):
+        """Should load a mix of CSV and Excel files in one call."""
+        data = self.loader.load_batch(
+            [sample_csv_file, sample_multisheet_excel_file],
+            sheet_names={sample_multisheet_excel_file: ["people"]},
+        )
+        assert set(data.keys()) == {sample_csv_file, sample_multisheet_excel_file}
+        assert isinstance(data[sample_csv_file], pd.DataFrame)
+        assert isinstance(data[sample_multisheet_excel_file], dict)
+        assert list(data[sample_multisheet_excel_file].keys()) == ["people"]
+
+    def test_load_batch_reports_failures(self, sample_csv_file):
+        """Should raise one summary error when batch loading fails."""
+        with pytest.raises(ValueError, match="Batch load failed"):
+            self.loader.load_batch([sample_csv_file, "missing-file.xlsx"])

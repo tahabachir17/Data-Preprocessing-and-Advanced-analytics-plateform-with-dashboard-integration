@@ -31,6 +31,19 @@ class DataCleaner:
         print(f"New column names: {df.columns.tolist()}")
         return df
 
+    def _column_matches_exclusion(self, column_name: str, exclude_keywords: list[str]) -> bool:
+        """
+        Match exclusion keywords against column-name tokens instead of raw substrings.
+
+        This prevents false positives such as matching ``id`` inside ``acide`` while
+        still excluding columns like ``sample_id`` or ``date_time``.
+        """
+        normalized_name = str(column_name).lower()
+        tokens = [token for token in re.split(r'[^a-z0-9]+', normalized_name) if token]
+        if normalized_name in exclude_keywords:
+            return True
+        return any(keyword in tokens for keyword in exclude_keywords)
+
     def _can_convert_to_numeric(self, series: pd.Series, threshold: float = 0.8) -> bool:
         """
         Check if a series can be meaningfully converted to numeric.
@@ -309,7 +322,7 @@ class DataCleaner:
         # Get numeric columns excluding those matching keywords
         numeric_cols = [
             col for col in df_result.select_dtypes(include=[np.number]).columns
-            if not any(k in col.lower() for k in exclude_keywords)
+            if not self._column_matches_exclusion(col, exclude_keywords)
         ]
 
         if not numeric_cols:
@@ -388,7 +401,10 @@ class DataCleaner:
                 df_cleaned['cao_bouillie'] = pd.to_numeric(df_cleaned['cao_bouillie'], errors='coerce')
             
             exclude_keywords = ['heure', 'hour', 'time', 'date', 'timestamp', 'poste', 'shift', 'team', 'station', 'lab', 'mois', 'semaine']
-            numeric_cols = [col for col in df_cleaned.select_dtypes(include=[np.number]).columns if not any(k in col.lower() for k in exclude_keywords)]
+            numeric_cols = [
+                col for col in df_cleaned.select_dtypes(include=[np.number]).columns
+                if not self._column_matches_exclusion(col, exclude_keywords)
+            ]
 
             # Find date column for filtering
             def find_column_by_keywords(keywords):

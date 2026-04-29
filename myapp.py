@@ -10,6 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import base64
+import joblib
 
 # Import lightweight custom classes (always needed)
 from src.data_processing.cleaner import DataCleaner
@@ -154,10 +155,25 @@ def initialize_session_state():
         'plot_counter': 0,
         'current_page': 'data_pipeline',  # Default page
         'selected_target': None,
+        'uploaded_dataframes': {},
+        'uploaded_dataset_order': [],
+        'active_dataset_key': None,
+        'processed_data': {},
+        'model_diagnostics_cache': {},
+        'processing_mode': "Apply to All",
         'cleaning_applied': False,
         'grouping_applied': False,
         'merging_applied': False,
-        'encoding_applied': False
+        'encoding_applied': False,
+        'target_encoder_bytes': None,
+        'target_encoder_columns': [],
+        'loaded_prediction_model': None,
+        'loaded_target_encoder': None,
+        'new_prediction_df': None,
+        'model_loaded': False,
+        'prediction_result_df': None,
+        'prediction_col_name': None,
+        'prediction_target_col': None,
     }
     
     for var, default_value in session_vars.items():
@@ -207,6 +223,739 @@ def export_plot_as_html(fig, filename):
     b64 = base64.b64encode(html_string.encode()).decode()
     href = f'<a href="data:text/html;base64,{b64}" download="{filename}.html">📊 Download Plot (HTML)</a>'
     return href
+
+@st.cache_resource(show_spinner=False)
+def load_cached_target_encoder(encoder_bytes: bytes):
+    """Deserialize and cache a fitted TargetEncoder for reuse across reruns."""
+    return joblib.load(BytesIO(encoder_bytes))
+
+
+def ensure_encoder_input_columns(dataframe, encoder):
+    """Match inference input to the exact raw schema expected by the fitted encoder."""
+    aligned_df = dataframe.copy()
+
+    expected_columns = None
+
+    if hasattr(encoder, 'feature_names_in_'):
+        expected_columns = list(encoder.feature_names_in_)
+    elif hasattr(encoder, 'ordinal_encoder') and hasattr(encoder.ordinal_encoder, 'feature_names_in_'):
+        expected_columns = list(encoder.ordinal_encoder.feature_names_in_)
+    elif hasattr(encoder, 'get_feature_names_in'):
+        expected_columns = list(encoder.get_feature_names_in())
+    else:
+        expected_columns = aligned_df.columns.tolist()
+
+    for column in expected_columns:
+        if column not in aligned_df.columns:
+            aligned_df[column] = np.nan
+
+    aligned_df = aligned_df[expected_columns]
+
+    return aligned_df
+
+
+def align_prediction_features(dataframe, expected_features):
+    """Match transformed inference data to the exact feature set used by the trained model."""
+    aligned_df = dataframe.copy()
+
+    for column in expected_features:
+        if column not in aligned_df.columns:
+            aligned_df[column] = 0
+
+    aligned_df = aligned_df[expected_features]
+
+    if aligned_df.isna().any().any():
+        aligned_df = aligned_df.fillna(0)
+
+    numeric_subset = aligned_df.select_dtypes(include=[np.number])
+    if np.isinf(numeric_subset).any().any():
+        aligned_df = aligned_df.replace([np.inf, -np.inf], 0)
+
+    return aligned_df
+
+
+def get_uploaded_file_extension(uploaded_file):
+    """Return the lowercase extension for an uploaded file."""
+    return os.path.splitext(uploaded_file.name)[1].lower()
+
+
+def inspect_excel_sheets(uploaded_file):
+    """Read workbook sheet names from an uploaded Excel file."""
+    workbook = BytesIO(uploaded_file.getvalue())
+    with pd.ExcelFile(workbook, engine='openpyxl') as excel_file:
+        return excel_file.sheet_names
+
+
+def build_sheet_preferences(uploaded_files):
+    """Build UI controls for Excel sheet selection."""
+    preferences = {}
+
+    for uploaded_file in uploaded_files:
+        extension = get_uploaded_file_extension(uploaded_file)
+        if extension not in {'.xlsx', '.xlsm'}:
+            continue
+
+        sheet_names = inspect_excel_sheets(uploaded_file)
+        if len(sheet_names) <= 1:
+            preferences[uploaded_file.name] = {
+                'load_all': False,
+                'selected_sheets': sheet_names,
+            }
+            continue
+
+        with st.expander(f"Sheet selection: {uploaded_file.name}", expanded=False):
+            st.caption(f"Detected {len(sheet_names)} sheets in `{uploaded_file.name}`.")
+            load_all = st.checkbox(
+                f"Load all sheets from {uploaded_file.name}",
+                value=True,
+                key=f"load_all_sheets_{uploaded_file.name}",
+            )
+
+            selected_sheets = sheet_names
+            if not load_all:
+                selected_sheets = st.multiselect(
+                    f"Choose sheets from {uploaded_file.name}",
+                    options=sheet_names,
+                    default=sheet_names[:1],
+                    key=f"sheet_selector_{uploaded_file.name}",
+                )
+
+            preferences[uploaded_file.name] = {
+                'load_all': load_all,
+                'selected_sheets': selected_sheets,
+            }
+
+    return preferences
+
+
+def has_multi_sheet_uploads(uploaded_files):
+    """Return True when at least one uploaded Excel workbook has multiple sheets."""
+    for uploaded_file in uploaded_files:
+        extension = get_uploaded_file_extension(uploaded_file)
+        if extension not in {'.xlsx', '.xlsm'}:
+            continue
+        if len(inspect_excel_sheets(uploaded_file)) > 1:
+            return True
+    return False
+
+
+def load_uploaded_files(uploaded_files, sheet_preferences):
+    """Load uploaded files and return flattened datasets keyed by filename and sheet."""
+    loaded_dataframes = {}
+    dataset_order = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        extension = get_uploaded_file_extension(uploaded_file)
+        status_text.info(f"Loading `{uploaded_file.name}` ({index}/{len(uploaded_files)})")
+        add_log(f"Loading file: {uploaded_file.name}")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+
+        try:
+            load_kwargs = {}
+            if extension in {'.xlsx', '.xlsm'}:
+                preference = sheet_preferences.get(uploaded_file.name, {})
+                selected_sheets = preference.get('selected_sheets') or []
+                load_all = preference.get('load_all', False)
+
+                if not load_all and not selected_sheets:
+                    raise ValueError("At least one sheet must be selected.")
+
+                if load_all:
+                    load_kwargs['load_all_sheets'] = True
+                else:
+                    load_kwargs['sheet_name'] = (
+                        selected_sheets if len(selected_sheets) > 1 else selected_sheets[0]
+                    )
+
+            loaded = st.session_state.loader.load_data(tmp_file_path, **load_kwargs)
+
+            if isinstance(loaded, dict):
+                for sheet_name, dataframe in loaded.items():
+                    dataset_key = f"{uploaded_file.name}_{sheet_name}"
+                    loaded_dataframes[dataset_key] = dataframe
+                    dataset_order.append(dataset_key)
+                    add_log(
+                        f"Loaded sheet '{sheet_name}' from {uploaded_file.name} - Shape: {dataframe.shape}"
+                    )
+            else:
+                dataset_key = uploaded_file.name
+                loaded_dataframes[dataset_key] = loaded
+                dataset_order.append(dataset_key)
+                add_log(f"Loaded {uploaded_file.name} - Shape: {loaded.shape}")
+        finally:
+            if os.path.exists(tmp_file_path):
+                os.unlink(tmp_file_path)
+
+        progress_bar.progress(index / len(uploaded_files))
+
+    status_text.success(f"Loaded {len(dataset_order)} dataset(s) from {len(uploaded_files)} file(s).")
+    return loaded_dataframes, dataset_order
+
+
+def render_dataset_preview(dataset_key, dataframe):
+    """Render a compact preview and profile for a loaded dataset."""
+    with st.expander(f"Preview: {dataset_key}", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Rows", dataframe.shape[0])
+        with col2:
+            st.metric("Columns", dataframe.shape[1])
+        with col3:
+            st.metric("Memory Usage", f"{dataframe.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
+
+        st.dataframe(dataframe.head(10), use_container_width=True)
+
+        col_info = pd.DataFrame({
+            'Column': dataframe.columns,
+            'Data Type': dataframe.dtypes.astype(str),
+            'Non-Null Count': dataframe.count(),
+            'Null Count': dataframe.isnull().sum(),
+            'Unique Values': [dataframe[col].nunique() for col in dataframe.columns]
+        })
+        st.dataframe(col_info, use_container_width=True)
+
+
+def sync_active_dataset():
+    """Keep the active raw dataframe aligned with the selected uploaded dataset."""
+    active_key = st.session_state.get('active_dataset_key')
+    uploaded_dataframes = st.session_state.get('uploaded_dataframes', {})
+    if active_key and active_key in uploaded_dataframes:
+        st.session_state.df_original = uploaded_dataframes[active_key].copy()
+
+
+def sync_processed_dataset_views():
+    """Mirror the active processed dataset into legacy single-dataset session keys."""
+    active_key = st.session_state.get('active_dataset_key')
+    processed_data = st.session_state.get('processed_data', {})
+    dataset_stages = processed_data.get(active_key)
+
+    if not dataset_stages:
+        return
+
+    st.session_state.df_cleaned = dataset_stages.get('cleaned')
+    st.session_state.df_encoded = dataset_stages.get('encoded')
+    st.session_state.df_grouped = dataset_stages.get('grouped')
+    st.session_state.cleaning_applied = dataset_stages.get('cleaned') is not None
+    st.session_state.encoding_applied = dataset_stages.get('encoded') is not None
+    st.session_state.grouping_applied = dataset_stages.get('grouped') is not None
+
+
+def parse_column_rename_rules(raw_rules):
+    """Parse newline-delimited old:new column rename rules."""
+    rename_map = {}
+    for line in raw_rules.splitlines():
+        if ":" not in line:
+            continue
+        original, renamed = line.split(":", 1)
+        original = original.strip()
+        renamed = renamed.strip()
+        if original and renamed:
+            rename_map[original] = renamed
+    return rename_map
+
+
+def get_common_columns(datasets):
+    """Return the sorted intersection of dataset columns."""
+    if not datasets:
+        return []
+
+    dataset_values = list(datasets.values())
+    common = set(dataset_values[0].columns)
+    for dataframe in dataset_values[1:]:
+        common &= set(dataframe.columns)
+    return sorted(common)
+
+
+def get_common_numeric_columns(datasets):
+    """Return columns that are numeric across every dataset."""
+    if not datasets:
+        return []
+
+    common_numeric = set(datasets[next(iter(datasets))].select_dtypes(include=[np.number]).columns)
+    for dataframe in datasets.values():
+        common_numeric &= set(dataframe.select_dtypes(include=[np.number]).columns)
+    return sorted(common_numeric)
+
+
+def render_cleaning_controls(dataframe, key_prefix):
+    """Render cleaning controls for a dataset scope."""
+    selectable_columns = dataframe.columns.tolist()
+    st.markdown("**Cleaning**")
+    enable_cleaning = st.checkbox(
+        "Apply cleaning",
+        value=True,
+        key=f"{key_prefix}_enable_cleaning",
+    )
+    cleaning_strategy = st.selectbox(
+        "Cleaning strategy",
+        ["statique", "frequence"],
+        key=f"{key_prefix}_cleaning_strategy",
+    )
+    frequency_lines = 1.0
+    if cleaning_strategy == "frequence":
+        frequency_lines = st.number_input(
+            "Interpolation frequency (hours/rows setting)",
+            min_value=0.1,
+            max_value=24.0,
+            value=1.0,
+            step=0.1,
+            key=f"{key_prefix}_frequency_lines",
+        )
+
+    rename_rules = st.text_area(
+        "Column rename rules (one `old:new` pair per line)",
+        value="",
+        key=f"{key_prefix}_rename_rules",
+    )
+
+    return {
+        "enable_cleaning": enable_cleaning,
+        "cleaning_strategy": cleaning_strategy,
+        "frequency_lines": frequency_lines,
+        "rename_rules": rename_rules,
+        "available_columns": selectable_columns,
+    }
+
+
+def render_encoding_controls(
+    dataframe,
+    key_prefix,
+    selectable_columns=None,
+    selectable_numeric_columns=None,
+):
+    """Render encoding controls for a dataset scope."""
+    selectable_columns = selectable_columns or dataframe.columns.tolist()
+    selectable_numeric_columns = selectable_numeric_columns or [
+        column for column in dataframe.select_dtypes(include=[np.number]).columns
+        if column in selectable_columns
+    ]
+
+    st.markdown("**Encoding**")
+    enable_encoding = st.checkbox(
+        "Apply encoding",
+        value=False,
+        key=f"{key_prefix}_enable_encoding",
+    )
+    encoding_strategy = st.selectbox(
+        "Encoding strategy",
+        ["smart", "one_hot", "label", "none"],
+        key=f"{key_prefix}_encoding_strategy",
+    )
+    target_column = st.selectbox(
+        "Target column (optional)",
+        options=["None"] + selectable_numeric_columns,
+        key=f"{key_prefix}_target_column",
+    )
+
+    return {
+        "enable_encoding": enable_encoding and encoding_strategy != "none",
+        "encoding_strategy": encoding_strategy,
+        "target_column": None if target_column == "None" else target_column,
+    }
+
+
+def render_grouping_controls(
+    dataframe,
+    key_prefix,
+    selectable_columns=None,
+):
+    """Render grouping controls for a dataset scope."""
+    selectable_columns = selectable_columns or dataframe.columns.tolist()
+
+    st.markdown("**Grouping / Aggregation**")
+    enable_grouping = st.checkbox(
+        "Apply grouping",
+        value=False,
+        key=f"{key_prefix}_enable_grouping",
+    )
+    group_columns = st.multiselect(
+        "Group by columns",
+        options=selectable_columns,
+        key=f"{key_prefix}_group_columns",
+    )
+    aggregation_functions = st.multiselect(
+        "Aggregation functions",
+        options=["sum", "mean", "max", "min", "count", "std"],
+        default=["sum", "mean"],
+        key=f"{key_prefix}_aggregation_functions",
+    )
+
+    return {
+        "enable_grouping": enable_grouping,
+        "group_columns": group_columns,
+        "aggregation_functions": aggregation_functions,
+    }
+
+
+def apply_encoding_strategy(dataframe, strategy, target_column=None):
+    """Apply the selected categorical encoding strategy."""
+    working_df = filter_zero_only_numeric_rows(dataframe)
+    if strategy == "smart":
+        return st.session_state.transformer.smart_categorical_encoding(
+            working_df,
+            target_col=target_column,
+        )
+
+    categorical_columns = working_df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+    if strategy == "one_hot":
+        encoded_df = pd.get_dummies(working_df, columns=categorical_columns, dtype=int)
+        bool_columns = encoded_df.select_dtypes(include="bool").columns
+        if len(bool_columns) > 0:
+            encoded_df[bool_columns] = encoded_df[bool_columns].astype(int)
+        return encoded_df
+
+    if strategy == "label":
+        for column in categorical_columns:
+            working_df[column] = pd.factorize(working_df[column].fillna("Unknown"), sort=True)[0]
+        bool_columns = working_df.select_dtypes(include="bool").columns
+        if len(bool_columns) > 0:
+            working_df[bool_columns] = working_df[bool_columns].astype(int)
+        return working_df
+
+    return working_df
+
+
+def filter_zero_only_numeric_rows(dataframe):
+    """Drop rows where every non-boolean numeric column is exactly zero."""
+    numeric_columns = dataframe.select_dtypes(include=[np.number]).columns
+
+    if len(numeric_columns) == 0:
+        return dataframe.copy()
+
+    zero_only_mask = dataframe.loc[:, numeric_columns].eq(0).all(axis=1)
+    return dataframe.loc[~zero_only_mask].reset_index(drop=True)
+
+
+def apply_grouping_settings(dataframe, group_columns, aggregation_functions):
+    """Group a dataframe using user-selected aggregation functions."""
+    if not group_columns:
+        return dataframe.copy()
+    if not aggregation_functions:
+        aggregation_functions = ["sum"]
+
+    missing_columns = [column for column in group_columns if column not in dataframe.columns]
+    if missing_columns:
+        raise ValueError(f"Grouping columns not found: {missing_columns}")
+
+    datetime_columns = dataframe.select_dtypes(include=["datetime64[ns]"]).columns.tolist()
+    numeric_columns = [
+        column
+        for column in dataframe.select_dtypes(include=[np.number]).columns
+        if column not in set(group_columns) | set(datetime_columns)
+    ]
+
+    if not numeric_columns:
+        return dataframe.groupby(group_columns).first().reset_index()
+
+    agg_map = {column: aggregation_functions for column in numeric_columns}
+    grouped = dataframe.groupby(group_columns).agg(agg_map).reset_index()
+    if isinstance(grouped.columns, pd.MultiIndex):
+        grouped.columns = [
+            "_".join(part for part in column if part).strip("_")
+            if isinstance(column, tuple)
+            else column
+            for column in grouped.columns
+        ]
+    return grouped
+
+
+def drop_selected_columns(dataframe, columns_to_drop):
+    """Drop user-selected columns that exist in the dataframe."""
+    if not columns_to_drop:
+        return dataframe.copy()
+
+    valid_columns = [column for column in columns_to_drop if column in dataframe.columns]
+    if not valid_columns:
+        return dataframe.copy()
+
+    return dataframe.drop(columns=valid_columns)
+
+
+def process_dataset_with_config(dataset_key, dataframe, config):
+    """Run cleaning, encoding, and grouping for one dataset."""
+    rename_map = parse_column_rename_rules(config["rename_rules"])
+    working_df = dataframe.copy()
+    cleaned_df = working_df.copy()
+
+    if config["enable_cleaning"]:
+        cleaned_df = st.session_state.cleaner.clean_data(
+            working_df.copy(),
+            config["cleaning_strategy"],
+            config["frequency_lines"],
+        )
+        if rename_map:
+            valid_renames = {old: new for old, new in rename_map.items() if old in cleaned_df.columns}
+            if valid_renames:
+                cleaned_df = cleaned_df.rename(columns=valid_renames)
+    effective_target = config["target_column"]
+    if effective_target in rename_map:
+        effective_target = rename_map[effective_target]
+
+    effective_group_columns = [rename_map.get(column, column) for column in config["group_columns"]]
+
+    encoded_df = cleaned_df.copy()
+    if config["enable_encoding"]:
+        encoded_df = apply_encoding_strategy(
+            cleaned_df.copy(),
+            config["encoding_strategy"],
+            target_column=effective_target,
+        )
+
+    grouped_df = cleaned_df.copy()
+    if config["enable_grouping"] and effective_group_columns:
+        grouped_df = apply_grouping_settings(
+            cleaned_df.copy(),
+            effective_group_columns,
+            config["aggregation_functions"],
+        )
+
+    final_df = grouped_df.copy() if config["enable_grouping"] else encoded_df.copy()
+
+    return {
+        "raw": dataframe.copy(),
+        "cleaned": cleaned_df.copy(),
+        "encoded": encoded_df.copy() if config["enable_encoding"] else None,
+        "grouped": grouped_df.copy() if config["enable_grouping"] else None,
+        "final": final_df,
+        "config": config,
+        "summary": {
+            "raw_shape": dataframe.shape,
+            "cleaned_shape": cleaned_df.shape,
+            "encoded_shape": encoded_df.shape if config["enable_encoding"] else None,
+            "grouped_shape": grouped_df.shape if config["enable_grouping"] else None,
+            "final_shape": final_df.shape,
+        },
+    }
+
+
+def get_stage_input_dataframe(dataset_key, preferred_stage):
+    """Return the best available in-memory dataframe for a processing stage."""
+    processed_entry = st.session_state.get("processed_data", {}).get(dataset_key, {})
+    if preferred_stage == "encoding":
+        return (
+            processed_entry.get("cleaned")
+            or processed_entry.get("raw")
+            or st.session_state.uploaded_dataframes[dataset_key]
+        )
+    if preferred_stage == "grouping":
+        return (
+            processed_entry.get("encoded")
+            or processed_entry.get("cleaned")
+            or processed_entry.get("raw")
+            or st.session_state.uploaded_dataframes[dataset_key]
+        )
+    return processed_entry.get("raw") or st.session_state.uploaded_dataframes[dataset_key]
+
+
+def process_cleaning_batch(config_map):
+    """Apply only cleaning settings across datasets."""
+    processed = st.session_state.get("processed_data", {}).copy()
+    ordered_keys = st.session_state.get("uploaded_dataset_order", [])
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for index, dataset_key in enumerate(ordered_keys, start=1):
+        status_text.info(f"Cleaning `{dataset_key}` ({index}/{len(ordered_keys)})")
+        raw_df = st.session_state.uploaded_dataframes[dataset_key].copy()
+        config = config_map[dataset_key]
+        rename_map = parse_column_rename_rules(config["rename_rules"])
+        cleaned_df = raw_df.copy()
+
+        if config["enable_cleaning"]:
+            cleaned_df = st.session_state.cleaner.clean_data(
+                raw_df.copy(),
+                config["cleaning_strategy"],
+                config["frequency_lines"],
+            )
+        if rename_map:
+            valid_renames = {old: new for old, new in rename_map.items() if old in cleaned_df.columns}
+            if valid_renames:
+                cleaned_df = cleaned_df.rename(columns=valid_renames)
+        existing = processed.get(dataset_key, {"raw": raw_df.copy()})
+        existing["raw"] = raw_df.copy()
+        existing["cleaned"] = cleaned_df.copy()
+        existing["final"] = cleaned_df.copy()
+        existing.setdefault("summary", {})
+        existing["summary"]["raw_shape"] = raw_df.shape
+        existing["summary"]["cleaned_shape"] = cleaned_df.shape
+        processed[dataset_key] = existing
+        progress_bar.progress(index / len(ordered_keys))
+
+    status_text.success(f"Cleaned {len(ordered_keys)} dataset(s).")
+    return processed
+
+
+def process_encoding_batch(config_map):
+    """Apply only encoding settings across datasets."""
+    processed = st.session_state.get("processed_data", {}).copy()
+    ordered_keys = st.session_state.get("uploaded_dataset_order", [])
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for index, dataset_key in enumerate(ordered_keys, start=1):
+        status_text.info(f"Encoding `{dataset_key}` ({index}/{len(ordered_keys)})")
+        base_df = get_stage_input_dataframe(dataset_key, "encoding").copy()
+        config = config_map[dataset_key]
+        encoded_df = base_df.copy()
+
+        if config["enable_encoding"]:
+            encoded_df = apply_encoding_strategy(
+                base_df.copy(),
+                config["encoding_strategy"],
+                target_column=config["target_column"],
+            )
+
+        existing = processed.get(dataset_key, {"raw": st.session_state.uploaded_dataframes[dataset_key].copy()})
+        existing["encoded"] = encoded_df.copy() if config["enable_encoding"] else None
+        existing["final"] = encoded_df.copy()
+        existing.setdefault("summary", {})
+        existing["summary"]["encoded_shape"] = encoded_df.shape if config["enable_encoding"] else None
+        existing["summary"]["final_shape"] = encoded_df.shape
+        processed[dataset_key] = existing
+        progress_bar.progress(index / len(ordered_keys))
+
+    status_text.success(f"Encoded {len(ordered_keys)} dataset(s).")
+    return processed
+
+
+def process_grouping_batch(config_map):
+    """Apply only grouping settings across datasets."""
+    processed = st.session_state.get("processed_data", {}).copy()
+    ordered_keys = st.session_state.get("uploaded_dataset_order", [])
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for index, dataset_key in enumerate(ordered_keys, start=1):
+        status_text.info(f"Grouping `{dataset_key}` ({index}/{len(ordered_keys)})")
+        base_df = get_stage_input_dataframe(dataset_key, "grouping").copy()
+        config = config_map[dataset_key]
+        grouped_df = base_df.copy()
+
+        if config["enable_grouping"] and config["group_columns"]:
+            grouped_df = apply_grouping_settings(
+                base_df.copy(),
+                config["group_columns"],
+                config["aggregation_functions"],
+            )
+
+        existing = processed.get(dataset_key, {"raw": st.session_state.uploaded_dataframes[dataset_key].copy()})
+        existing["grouped"] = grouped_df.copy() if config["enable_grouping"] else None
+        existing["final"] = grouped_df.copy()
+        existing.setdefault("summary", {})
+        existing["summary"]["grouped_shape"] = grouped_df.shape if config["enable_grouping"] else None
+        existing["summary"]["final_shape"] = grouped_df.shape
+        processed[dataset_key] = existing
+        progress_bar.progress(index / len(ordered_keys))
+
+    status_text.success(f"Grouped {len(ordered_keys)} dataset(s).")
+    return processed
+
+
+def apply_post_cleaning_column_drop(dataset_key, columns_to_drop):
+    """Apply column deletion to an already cleaned dataset and persist it."""
+    processed = st.session_state.get("processed_data", {})
+    if dataset_key not in processed or processed[dataset_key].get("cleaned") is None:
+        raise ValueError(f"No cleaned dataset available for '{dataset_key}'.")
+
+    cleaned_df = processed[dataset_key]["cleaned"].copy()
+    updated_cleaned_df = drop_selected_columns(cleaned_df, columns_to_drop)
+    processed[dataset_key]["cleaned"] = updated_cleaned_df
+    processed[dataset_key]["final"] = updated_cleaned_df.copy()
+    processed[dataset_key].setdefault("summary", {})
+    processed[dataset_key]["summary"]["cleaned_shape"] = updated_cleaned_df.shape
+    processed[dataset_key]["summary"]["final_shape"] = updated_cleaned_df.shape
+    processed[dataset_key]["post_cleaning_dropped_columns"] = columns_to_drop
+    st.session_state.processed_data = processed
+
+
+def apply_post_cleaning_zero_only_row_removal(dataset_key, datetime_col=None):
+    """Remove zero-only rows from an already cleaned dataset and persist it."""
+    from src.analytics.ml_models import remove_zero_only_rows
+
+    processed = st.session_state.get("processed_data", {})
+    if dataset_key not in processed or processed[dataset_key].get("cleaned") is None:
+        raise ValueError(f"No cleaned dataset available for '{dataset_key}'.")
+
+    cleaned_df = processed[dataset_key]["cleaned"].copy()
+    updated_cleaned_df = remove_zero_only_rows(cleaned_df, datetime_col=datetime_col)
+    removed_count = len(cleaned_df) - len(updated_cleaned_df)
+
+    processed[dataset_key]["cleaned"] = updated_cleaned_df
+    processed[dataset_key]["final"] = updated_cleaned_df.copy()
+    processed[dataset_key].setdefault("summary", {})
+    processed[dataset_key]["summary"]["cleaned_shape"] = updated_cleaned_df.shape
+    processed[dataset_key]["summary"]["final_shape"] = updated_cleaned_df.shape
+    processed[dataset_key]["post_cleaning_zero_only_rows_removed"] = removed_count
+    st.session_state.processed_data = processed
+    return removed_count
+
+
+def get_cleaned_dataset_columns(processed_data):
+    """Return the common columns across cleaned datasets."""
+    cleaned_datasets = [
+        dataset_entry["cleaned"]
+        for dataset_entry in processed_data.values()
+        if dataset_entry.get("cleaned") is not None
+    ]
+    if not cleaned_datasets:
+        return []
+
+    common_columns = set(cleaned_datasets[0].columns)
+    for dataframe in cleaned_datasets[1:]:
+        common_columns &= set(dataframe.columns)
+    return sorted(common_columns)
+
+
+def process_multiple_datasets(config_map):
+    """Apply batch processing configs to every uploaded dataset in memory."""
+    processed = {}
+    ordered_keys = st.session_state.get("uploaded_dataset_order", [])
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for index, dataset_key in enumerate(ordered_keys, start=1):
+        status_text.info(f"Processing `{dataset_key}` ({index}/{len(ordered_keys)})")
+        dataset = st.session_state.uploaded_dataframes[dataset_key]
+        processed[dataset_key] = process_dataset_with_config(dataset_key, dataset, config_map[dataset_key])
+        progress_bar.progress(index / len(ordered_keys))
+        add_log(f"Processed dataset: {dataset_key}")
+
+    status_text.success(f"Processed {len(processed)} dataset(s).")
+    return processed
+
+
+def render_processed_results(processed_data):
+    """Display final processed dataset previews."""
+    st.subheader("Processed Dataset Preview")
+    for dataset_key in st.session_state.get("uploaded_dataset_order", []):
+        if dataset_key not in processed_data:
+            continue
+        dataset_result = processed_data[dataset_key]
+        summary = dataset_result["summary"]
+        with st.expander(f"Processed: {dataset_key}", expanded=False):
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Raw", f"{summary['raw_shape'][0]} x {summary['raw_shape'][1]}")
+            with col2:
+                st.metric("Cleaned", f"{summary['cleaned_shape'][0]} x {summary['cleaned_shape'][1]}")
+            with col3:
+                st.metric(
+                    "Encoded",
+                    f"{summary['encoded_shape'][0]} x {summary['encoded_shape'][1]}"
+                    if summary['encoded_shape'] is not None
+                    else "Not applied",
+                )
+            with col4:
+                st.metric("Final", f"{summary['final_shape'][0]} x {summary['final_shape'][1]}")
+
+            st.dataframe(dataset_result["final"].head(10), use_container_width=True)
+
 
 def compare_datasets(df_original, df_processed, title="Dataset Comparison"):
     """Compare original vs processed datasets"""
@@ -337,6 +1086,101 @@ def create_model_summary_dataframe(model_scores, best_model_name):
         })
     
     return pd.DataFrame(summary).sort_values('R² Score', ascending=False)
+
+def render_regression_metric_cards(metrics):
+    """Render a compact metric summary for a regression model."""
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("R² Score", f"{metrics.get('r2_score', 0):.4f}")
+    with col2:
+        st.metric("RMSE", f"{metrics.get('rmse', 0):.4f}")
+    with col3:
+        st.metric("MAE", f"{metrics.get('mae', 0):.4f}")
+    with col4:
+        st.metric("MAPE", f"{metrics.get('mape', 0):.2f}%")
+
+
+def render_learning_curve_chart(learning_curve_data, model_name):
+    """Render the RMSE learning curve for the selected model."""
+    if not learning_curve_data:
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=learning_curve_data['train_sizes'],
+        y=learning_curve_data['train_rmse'],
+        mode='lines+markers',
+        name='Training RMSE',
+    ))
+    fig.add_trace(go.Scatter(
+        x=learning_curve_data['train_sizes'],
+        y=learning_curve_data['validation_rmse'],
+        mode='lines+markers',
+        name='Validation RMSE',
+    ))
+    fig.update_layout(
+        title=f"Learning Curve - {model_name}",
+        xaxis_title="Training Set Size",
+        yaxis_title="RMSE",
+        height=420,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_validation_curve_chart(validation_curve_data, model_name):
+    """Render the validation curve for the selected model."""
+    if not validation_curve_data:
+        return
+
+    x_axis_name = validation_curve_data['param_name']
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=validation_curve_data['param_values'],
+        y=validation_curve_data['train_rmse'],
+        mode='lines+markers',
+        name='Training RMSE',
+    ))
+    fig.add_trace(go.Scatter(
+        x=validation_curve_data['param_values'],
+        y=validation_curve_data['validation_rmse'],
+        mode='lines+markers',
+        name='Validation RMSE',
+    ))
+    fig.update_layout(
+        title=f"Validation Curve - {model_name}",
+        xaxis_title=x_axis_name,
+        yaxis_title="RMSE",
+        height=420,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_iteration_history_chart(iteration_history, model_name):
+    """Render the boosting training history for the selected model."""
+    if not iteration_history:
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=iteration_history['iterations'],
+        y=iteration_history['train_rmse'],
+        mode='lines',
+        name='Training RMSE',
+    ))
+    fig.add_trace(go.Scatter(
+        x=iteration_history['iterations'],
+        y=iteration_history['validation_rmse'],
+        mode='lines',
+        name='Validation RMSE',
+    ))
+    fig.update_layout(
+        title=f"Iteration History - {model_name}",
+        xaxis_title="Number of Boosting Iterations",
+        yaxis_title="RMSE",
+        height=420,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 def display_regression_results():
     """Display results specifically for regression"""
@@ -534,7 +1378,7 @@ def display_regression_results():
             # File uploader for prediction data
             prediction_file = st.file_uploader(
                 "Choose a CSV or Excel file for predictions:",
-                type=['csv', 'xlsx'],
+                type=['csv', 'xlsx', 'xlsm'],
                 key="prediction_data",
                 help="Upload data without the target column to get predictions"
             )
@@ -545,7 +1389,7 @@ def display_regression_results():
                     if prediction_file.name.endswith('.csv'):
                         pred_df = pd.read_csv(prediction_file)
                     else:
-                        pred_df = pd.read_excel(prediction_file)
+                        pred_df = pd.read_excel(prediction_file, engine='openpyxl')
                     
                     st.success(f"✅ Prediction data loaded: {pred_df.shape[0]:,} rows × {pred_df.shape[1]} columns")
                     
@@ -641,7 +1485,7 @@ if st.sidebar.button("🔧 Data Processing Pipeline", use_container_width=True):
 if st.sidebar.button("📊 Data Visualization Studio", use_container_width=True):
     st.session_state.current_page = "visualization"
 
-if st.sidebar.button("🔬 Advanced Analytics", use_container_width=True):
+if st.sidebar.button("🔬 Exploratory Analytics", use_container_width=True):
     st.session_state.current_page = "analytics"
 
 if st.sidebar.button("🤖 Predictive Modeling", use_container_width=True):
@@ -681,8 +1525,19 @@ if st.session_state.df_cleaned is not None or st.session_state.df_grouped is not
     st.sidebar.markdown("### 🔄 Quick Actions")
     
     if st.sidebar.button("🗑️ Reset All Data", use_container_width=True):
-        for key in ['df_original', 'df_cleaned', 'df_second', 'df_grouped', 'df_merged', 'df_encoded']:
+        for key in [
+            'df_original',
+            'df_cleaned',
+            'df_second',
+            'df_grouped',
+            'df_merged',
+            'df_encoded',
+            'active_dataset_key',
+        ]:
             st.session_state[key] = None
+        st.session_state.uploaded_dataframes = {}
+        st.session_state.uploaded_dataset_order = []
+        st.session_state.processed_data = {}
         for key in ['cleaning_applied', 'grouping_applied', 'merging_applied', 'encoding_applied']:
             st.session_state[key] = False
         st.session_state.plots_history = []
@@ -708,60 +1563,75 @@ if page == "data_pipeline":
     # ===========================================
     st.header("📁 Data Loading")
     
-    uploaded_file = st.file_uploader(
-        "Choose a CSV or Excel file",
-        type=['csv', 'xlsx'],
-        help="Upload your dataset to get started"
+    uploaded_files = st.file_uploader(
+        "Choose one or more CSV or Excel files",
+        type=["csv", "xlsx", "xlsm"],
+        accept_multiple_files=True,
+        help="Upload one or more datasets to get started. Multi-sheet Excel files are supported."
     )
-    
-    if uploaded_file is not None:
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
-        
-        try:
-            with st.spinner("Loading data..."):
-                add_log(f"Loading file: {uploaded_file.name}")
-                # Use your DataLoader class
-                df = st.session_state.loader.loader(tmp_file_path)
-                st.session_state.df_original = df
-                
-                add_log(f"Data loaded successfully - Shape: {df.shape}")
-                st.success("✅ Data loaded successfully!")
-                
-                # Display basic info
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Rows", df.shape[0])
-                with col2:
-                    st.metric("Columns", df.shape[1])
-                with col3:
-                    st.metric("Memory Usage", f"{df.memory_usage(deep=True).sum() / (1024**2):.2f} MB")
-                
-                # Show preview
-                st.subheader("Data Preview")
-                st.dataframe(df.head(10), use_container_width=True)
-                
-                # Show column info
-                with st.expander("Column Information", expanded=False):
-                    col_info = pd.DataFrame({
-                        'Column': df.columns,
-                        'Data Type': df.dtypes.astype(str),
-                        'Non-Null Count': df.count(),
-                        'Null Count': df.isnull().sum(),
-                        'Unique Values': [df[col].nunique() for col in df.columns]
-                    })
-                    st.dataframe(col_info, use_container_width=True)
-                
-        except Exception as e:
-            error_msg = f"Error loading data: {str(e)}"
-            add_log(error_msg, "ERROR")
-            st.error(error_msg)
-        finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_file_path):
-                os.unlink(tmp_file_path)
+
+    sheet_preferences = {}
+    if uploaded_files:
+        if has_multi_sheet_uploads(uploaded_files):
+            st.info("Select which Excel sheets to load before starting the batch import.")
+        sheet_preferences = build_sheet_preferences(uploaded_files)
+
+        if st.button("Load Selected Files", type="primary", use_container_width=True):
+            try:
+                loaded_dataframes, dataset_order = load_uploaded_files(uploaded_files, sheet_preferences)
+                st.session_state.uploaded_dataframes = loaded_dataframes
+                st.session_state.uploaded_dataset_order = dataset_order
+                st.session_state.processed_data = {}
+                st.session_state.df_cleaned = None
+                st.session_state.df_grouped = None
+                st.session_state.df_merged = None
+                st.session_state.df_encoded = None
+                st.session_state.cleaning_applied = False
+                st.session_state.grouping_applied = False
+                st.session_state.merging_applied = False
+                st.session_state.encoding_applied = False
+
+                if dataset_order:
+                    if st.session_state.active_dataset_key not in loaded_dataframes:
+                        st.session_state.active_dataset_key = dataset_order[0]
+                    sync_active_dataset()
+                    sync_processed_dataset_views()
+                    st.success(
+                        f"Loaded {len(dataset_order)} dataset(s) from {len(uploaded_files)} uploaded file(s)."
+                    )
+                else:
+                    st.warning("No datasets were loaded from the selected files.")
+            except Exception as e:
+                error_msg = f"Error loading uploaded files: {str(e)}"
+                add_log(error_msg, "ERROR")
+                st.error(error_msg)
+
+    uploaded_datasets = st.session_state.get('uploaded_dataframes', {})
+    uploaded_dataset_order = st.session_state.get('uploaded_dataset_order', [])
+
+    if uploaded_datasets:
+        st.subheader("Loaded Datasets")
+        selected_active_dataset = st.selectbox(
+            "Choose the active dataset for the preprocessing pipeline:",
+            options=uploaded_dataset_order,
+            index=uploaded_dataset_order.index(st.session_state.active_dataset_key)
+            if st.session_state.active_dataset_key in uploaded_dataset_order
+            else 0,
+            key="active_dataset_selector",
+        )
+
+        if selected_active_dataset != st.session_state.active_dataset_key:
+            st.session_state.active_dataset_key = selected_active_dataset
+        sync_active_dataset()
+        sync_processed_dataset_views()
+
+        st.caption(
+            "The active dataset is copied into st.session_state.df_original so the existing cleaning "
+            "and transformation steps continue to work."
+        )
+
+        for dataset_key in uploaded_dataset_order:
+            render_dataset_preview(dataset_key, uploaded_datasets[dataset_key])
 
     st.markdown("---")
 
@@ -770,7 +1640,123 @@ if page == "data_pipeline":
     # ===========================================
     st.header("🧹 Data Cleaning")
     
-    if st.session_state.df_original is None:
+    if len(uploaded_datasets) > 1:
+        st.subheader("Batch Processing Mode")
+        st.session_state.processing_mode = st.radio(
+            "How should we apply batch settings?",
+            options=["Apply to All", "Configure Individually"],
+            horizontal=True,
+        )
+
+        if st.session_state.processing_mode == "Apply to All":
+            reference_key = st.session_state.active_dataset_key or uploaded_dataset_order[0]
+            reference_df = uploaded_datasets[reference_key]
+            global_config = render_cleaning_controls(reference_df, "global_cleaning")
+
+            if st.button("Run Batch Cleaning", type="primary", key="run_global_batch_cleaning"):
+                config_map = {
+                    dataset_key: global_config
+                    for dataset_key in uploaded_dataset_order
+                }
+                try:
+                    st.session_state.processed_data = process_cleaning_batch(config_map)
+                    sync_processed_dataset_views()
+                    st.success("Batch cleaning completed with global settings.")
+                except Exception as e:
+                    error_msg = f"Batch cleaning failed: {str(e)}"
+                    add_log(error_msg, "ERROR")
+                    st.error(error_msg)
+
+        else:
+            individual_configs = {}
+            for dataset_key in uploaded_dataset_order:
+                dataset_df = uploaded_datasets[dataset_key]
+                with st.expander(dataset_key, expanded=False):
+                    individual_configs[dataset_key] = render_cleaning_controls(
+                        dataset_df,
+                        f"individual_cleaning_{dataset_key}",
+                    )
+
+            if st.button("Run Individual Batch Cleaning", type="primary", key="run_individual_batch_cleaning"):
+                try:
+                    st.session_state.processed_data = process_cleaning_batch(individual_configs)
+                    sync_processed_dataset_views()
+                    st.success("Batch cleaning completed with individual dataset settings.")
+                except Exception as e:
+                    error_msg = f"Individual batch cleaning failed: {str(e)}"
+                    add_log(error_msg, "ERROR")
+                    st.error(error_msg)
+
+        if st.session_state.processed_data:
+            render_processed_results(st.session_state.processed_data)
+            st.markdown("**Post-Cleaning Zero-Only Row Removal**")
+
+            cleaned_dataset_keys = [
+                dataset_key
+                for dataset_key in uploaded_dataset_order
+                if st.session_state.processed_data.get(dataset_key, {}).get("cleaned") is not None
+            ]
+
+            if cleaned_dataset_keys:
+                if st.session_state.processing_mode == "Apply to All":
+                    if st.button("Apply Zero-Only Row Removal to Cleaned Datasets", key="apply_global_zero_only_row_removal"):
+                        removal_messages = []
+                        for dataset_key in cleaned_dataset_keys:
+                            removed_count = apply_post_cleaning_zero_only_row_removal(dataset_key)
+                            removal_messages.append(f"{dataset_key}: {removed_count}")
+                        sync_processed_dataset_views()
+                        st.success(
+                            "Zero-only row removal applied to all cleaned datasets. "
+                            + " | ".join(removal_messages)
+                        )
+                    st.caption(
+                        "This action checks only numeric columns in the cleaned dataset and ignores datetime/date/time and categorical columns."
+                    )
+                else:
+                    for dataset_key in cleaned_dataset_keys:
+                        with st.expander(f"Remove zero-only rows: {dataset_key}", expanded=False):
+                            if st.button("Apply Zero-Only Row Removal", key=f"apply_zero_only_rows_{dataset_key}"):
+                                removed_count = apply_post_cleaning_zero_only_row_removal(dataset_key)
+                                sync_processed_dataset_views()
+                                st.success(
+                                    f"Updated cleaned dataset: {dataset_key}. Removed {removed_count} zero-only rows."
+                                )
+                            st.caption(
+                                "Checks only numeric columns and ignores datetime/date/time and categorical columns."
+                            )
+
+            st.markdown("**Post-Cleaning Column Deletion**")
+
+            if cleaned_dataset_keys:
+                if st.session_state.processing_mode == "Apply to All":
+                    common_cleaned_columns = get_cleaned_dataset_columns(st.session_state.processed_data)
+                    global_drop_columns = st.multiselect(
+                        "Delete columns from all cleaned datasets:",
+                        options=common_cleaned_columns,
+                        default=[],
+                        key="global_post_cleaning_drop_columns",
+                    )
+                    if st.button("Apply Column Deletion to Cleaned Datasets", key="apply_global_cleaned_drop"):
+                        for dataset_key in cleaned_dataset_keys:
+                            apply_post_cleaning_column_drop(dataset_key, global_drop_columns)
+                        sync_processed_dataset_views()
+                        st.success("Column deletion applied to all cleaned datasets.")
+                else:
+                    for dataset_key in cleaned_dataset_keys:
+                        cleaned_df = st.session_state.processed_data[dataset_key]["cleaned"]
+                        with st.expander(f"Delete columns: {dataset_key}", expanded=False):
+                            dataset_drop_columns = st.multiselect(
+                                f"Columns to delete from {dataset_key}",
+                                options=cleaned_df.columns.tolist(),
+                                default=[],
+                                key=f"post_clean_drop_{dataset_key}",
+                            )
+                            if st.button("Apply Column Deletion", key=f"apply_post_clean_drop_{dataset_key}"):
+                                apply_post_cleaning_column_drop(dataset_key, dataset_drop_columns)
+                                sync_processed_dataset_views()
+                                st.success(f"Updated cleaned dataset: {dataset_key}")
+
+    elif st.session_state.df_original is None:
         st.warning("⚠️ Please load a dataset first from the Data Loading section above.")
     else:
         df = st.session_state.df_original.copy()
@@ -846,6 +1832,7 @@ if page == "data_pipeline":
                     help="Time interval in hours for data interpolation (e.g., 1.0 for hourly, 0.5 for 30 minutes)"
                 )
                 st.info(f"Selected frequency: {frequency_hours} hour(s)")
+
             
             if st.button("🧹 Clean Data", type="primary"):
                 with st.spinner("Cleaning data..."):
@@ -865,7 +1852,7 @@ if page == "data_pipeline":
                             'initial_shape': initial_shape,
                             'final_shape': cleaned_df.shape,
                             'strategy': data_type,
-                            'frequency': frequency_hours if data_type == "frequence" else None
+                            'frequency': frequency_hours if data_type == "frequence" else None,
                         }
                         
                         success_msg = f"✅ Data cleaned successfully using {data_type} strategy! Original data dropped."
@@ -900,6 +1887,24 @@ if page == "data_pipeline":
                 
                 # Show cleaned data preview
                 if st.session_state.df_cleaned is not None:
+                    columns_to_drop_after_cleaning = st.multiselect(
+                        "Delete columns from the cleaned dataset:",
+                        options=st.session_state.df_cleaned.columns.tolist(),
+                        default=[],
+                        key="single_post_cleaning_drop_columns",
+                    )
+                    if st.button("Apply Column Deletion to Cleaned Dataset", key="apply_single_post_cleaning_drop"):
+                        st.session_state.df_cleaned = drop_selected_columns(
+                            st.session_state.df_cleaned,
+                            columns_to_drop_after_cleaning,
+                        )
+                        st.session_state.cleaning_results['final_shape'] = st.session_state.df_cleaned.shape
+                        st.session_state.cleaning_results['dropped_columns'] = columns_to_drop_after_cleaning
+                        st.success("Column deletion applied to the cleaned dataset.")
+
+                    if results.get('dropped_columns'):
+                        st.write(f"**Dropped Columns:** {results['dropped_columns']}")
+
                     with st.expander("Cleaned Data Preview", expanded=False):
                         st.dataframe(st.session_state.df_cleaned.head(10), use_container_width=True)
 
@@ -910,7 +1915,95 @@ if page == "data_pipeline":
     # ===========================================
     st.header("🔄 Data Transformation")
     
-    if st.session_state.df_cleaned is None:
+    if len(uploaded_datasets) > 1:
+        st.subheader("Categorical Encoding")
+        if st.session_state.processing_mode == "Apply to All":
+            common_columns = get_common_columns(uploaded_datasets)
+            common_numeric_columns = get_common_numeric_columns(uploaded_datasets)
+            reference_key = st.session_state.active_dataset_key or uploaded_dataset_order[0]
+            reference_df = get_stage_input_dataframe(reference_key, "encoding")
+            if common_columns:
+                st.caption("Global encoding uses only columns shared across all datasets.")
+            encoding_config = render_encoding_controls(
+                reference_df,
+                "global_encoding",
+                selectable_columns=common_columns or reference_df.columns.tolist(),
+                selectable_numeric_columns=common_numeric_columns,
+            )
+            if st.button("Run Batch Encoding", type="primary", key="run_global_batch_encoding"):
+                config_map = {dataset_key: encoding_config for dataset_key in uploaded_dataset_order}
+                try:
+                    st.session_state.processed_data = process_encoding_batch(config_map)
+                    sync_processed_dataset_views()
+                    st.success("Batch encoding completed with global settings.")
+                except Exception as e:
+                    error_msg = f"Batch encoding failed: {str(e)}"
+                    add_log(error_msg, "ERROR")
+                    st.error(error_msg)
+        else:
+            individual_encoding_configs = {}
+            for dataset_key in uploaded_dataset_order:
+                dataset_df = get_stage_input_dataframe(dataset_key, "encoding")
+                with st.expander(f"Encoding: {dataset_key}", expanded=False):
+                    individual_encoding_configs[dataset_key] = render_encoding_controls(
+                        dataset_df,
+                        f"individual_encoding_{dataset_key}",
+                    )
+            if st.button("Run Individual Batch Encoding", type="primary", key="run_individual_batch_encoding"):
+                try:
+                    st.session_state.processed_data = process_encoding_batch(individual_encoding_configs)
+                    sync_processed_dataset_views()
+                    st.success("Batch encoding completed with individual dataset settings.")
+                except Exception as e:
+                    error_msg = f"Individual batch encoding failed: {str(e)}"
+                    add_log(error_msg, "ERROR")
+                    st.error(error_msg)
+
+        st.markdown("**---**")
+        st.subheader("Data Grouping")
+        if st.session_state.processing_mode == "Apply to All":
+            common_columns = get_common_columns(uploaded_datasets)
+            reference_key = st.session_state.active_dataset_key or uploaded_dataset_order[0]
+            reference_df = get_stage_input_dataframe(reference_key, "grouping")
+            if common_columns:
+                st.caption("Global grouping uses only columns shared across all datasets.")
+            grouping_config = render_grouping_controls(
+                reference_df,
+                "global_grouping",
+                selectable_columns=common_columns or reference_df.columns.tolist(),
+            )
+            if st.button("Run Batch Grouping", type="primary", key="run_global_batch_grouping"):
+                config_map = {dataset_key: grouping_config for dataset_key in uploaded_dataset_order}
+                try:
+                    st.session_state.processed_data = process_grouping_batch(config_map)
+                    sync_processed_dataset_views()
+                    st.success("Batch grouping completed with global settings.")
+                except Exception as e:
+                    error_msg = f"Batch grouping failed: {str(e)}"
+                    add_log(error_msg, "ERROR")
+                    st.error(error_msg)
+        else:
+            individual_grouping_configs = {}
+            for dataset_key in uploaded_dataset_order:
+                dataset_df = get_stage_input_dataframe(dataset_key, "grouping")
+                with st.expander(f"Grouping: {dataset_key}", expanded=False):
+                    individual_grouping_configs[dataset_key] = render_grouping_controls(
+                        dataset_df,
+                        f"individual_grouping_{dataset_key}",
+                    )
+            if st.button("Run Individual Batch Grouping", type="primary", key="run_individual_batch_grouping"):
+                try:
+                    st.session_state.processed_data = process_grouping_batch(individual_grouping_configs)
+                    sync_processed_dataset_views()
+                    st.success("Batch grouping completed with individual dataset settings.")
+                except Exception as e:
+                    error_msg = f"Individual batch grouping failed: {str(e)}"
+                    add_log(error_msg, "ERROR")
+                    st.error(error_msg)
+
+        if st.session_state.processed_data:
+            render_processed_results(st.session_state.processed_data)
+    elif st.session_state.df_cleaned is None:
         st.warning("⚠️ Please clean your data first from the Data Cleaning section above.")
     else:
         current_df = st.session_state.df_cleaned.copy()
@@ -940,9 +2033,27 @@ if page == "data_pipeline":
                         add_log("Starting categorical encoding on cleaned data")
                         
                         # Use the smart encoding function from transformer
+                        filtered_df = filter_zero_only_numeric_rows(current_df)
                         pred_df_raw = st.session_state.transformer.smart_categorical_encoding(
-                            current_df.copy(), target_col=target_column
+                            filtered_df.copy(), target_col=target_column
                         )
+
+                        st.session_state.target_encoder_bytes = None
+                        st.session_state.target_encoder_columns = []
+
+                        if target_column is not None:
+                            fitted_target_encoder, encoded_columns = st.session_state.transformer.fit_target_encoder(
+                                filtered_df.copy(),
+                                target_col=target_column,
+                            )
+                            if fitted_target_encoder is not None:
+                                encoder_buffer = BytesIO()
+                                joblib.dump(fitted_target_encoder, encoder_buffer)
+                                st.session_state.target_encoder_bytes = encoder_buffer.getvalue()
+                                st.session_state.target_encoder_columns = encoded_columns
+                                st.session_state.loaded_target_encoder = load_cached_target_encoder(
+                                    st.session_state.target_encoder_bytes
+                                )
                         
                         
                         # Store as independent encoded dataframe
@@ -982,6 +2093,17 @@ if page == "data_pipeline":
                 if st.session_state.df_encoded is not None:
                     with st.expander("Encoded Data Preview", expanded=False):
                         st.dataframe(st.session_state.df_encoded.head(10), use_container_width=True)
+                    if st.session_state.get('target_encoder_bytes'):
+                        encoded_columns = st.session_state.get('target_encoder_columns', [])
+                        if encoded_columns:
+                            st.caption(f"Saved TargetEncoder columns: {', '.join(encoded_columns)}")
+                        st.download_button(
+                            label="📥 Download Fitted TargetEncoder",
+                            data=st.session_state.target_encoder_bytes,
+                            file_name="target_encoder.pkl",
+                            mime="application/octet-stream",
+                            key="download_target_encoder_artifact",
+                        )
 
         st.markdown("**---**")
 
@@ -1061,7 +2183,7 @@ if page == "data_pipeline":
             # File uploader for second dataset
             second_file = st.file_uploader(
                 "Upload second dataset:",
-                type=['csv', 'xlsx'],
+                type=['csv', 'xlsx', 'xlsm'],
                 key="second_dataset_pipeline"
             )
             
@@ -1447,8 +2569,8 @@ elif page == "visualization":
 
 # Advanced Analytics Section
 elif page == "analytics":
-    st.header("🔬 Advanced Analytics")
-    st.markdown("Statistical analysis, hypothesis testing, and data quality tools")
+    st.header("🔬 Exploratory Analytics")
+    st.markdown("Statistical, correlation and distribution analysis and data quality tools")
     st.markdown("---")
     
     # Lazy imports — only loaded when user visits this page
@@ -1495,11 +2617,10 @@ elif page == "analytics":
         st.info(f"Analyzing {selected_dataset}: {current_df.shape[0]:,} rows × {current_df.shape[1]} columns")
         
         # Expanded Analytics tabs
-        analytics_tab1, analytics_tab2, analytics_tab3, analytics_tab4, analytics_tab5, analytics_tab6 = st.tabs([
+        analytics_tab1, analytics_tab2, analytics_tab3, analytics_tab5, analytics_tab6 = st.tabs([
             "📊 Descriptive Stats", 
             "🔗 Correlation Analysis", 
             "📈 Distribution Analysis",
-            "🧪 Hypothesis Testing",
             "🎯 Outlier Detection",
             "📋 Data Quality Report"
         ])
@@ -1631,35 +2752,6 @@ elif page == "analytics":
                         )
                         st.plotly_chart(fig_box, use_container_width=True)
                     
-                    # Normality testing
-                    st.subheader("🔬 Normality Tests")
-                    normality_result = st.session_state.stat_analyzer.test_normality(current_df[selected_col])
-                    
-                    if 'error' not in normality_result:
-                        col1, col2, col3 = st.columns(3)
-                        
-                        for i, (test_name, test_result) in enumerate(normality_result.get('tests', {}).items()):
-                            if 'error' not in test_result:
-                                with [col1, col2, col3][i % 3]:
-                                    is_normal = test_result.get('is_normal', False)
-                                    if 'p_value' in test_result:
-                                        display_val = f"p = {test_result['p_value']:.4f}"
-                                    else:
-                                        display_val = f"stat = {test_result['statistic']:.4f}"
-                                    st.metric(
-                                        test_name.replace('_', ' ').title(),
-                                        display_val,
-                                        delta="Normal" if is_normal else "Not Normal",
-                                        delta_color="normal" if is_normal else "inverse"
-                                    )
-                        
-                        overall = normality_result.get('overall_conclusion', {})
-                        if overall.get('is_normal') is not None:
-                            if overall['is_normal']:
-                                st.success(f"✅ Data appears normally distributed ({overall['normal_tests']}/{overall['total_tests']} tests passed)")
-                            else:
-                                st.warning(f"⚠️ Data does not appear normally distributed ({overall['normal_tests']}/{overall['total_tests']} tests passed)")
-                    
                     # Skewness and Kurtosis
                     with st.expander("📊 Skewness & Kurtosis Analysis"):
                         sk_result = st.session_state.stat_analyzer.get_skewness_kurtosis(current_df[selected_col])
@@ -1673,310 +2765,6 @@ elif page == "analytics":
             else:
                 st.info("No numerical columns available for distribution analysis")
         
-        # =============================================
-        # TAB 4: HYPOTHESIS TESTING
-        # =============================================
-        with analytics_tab4:
-            st.subheader("🧪 Hypothesis Testing")
-            st.markdown("Perform statistical hypothesis tests on your data")
-            
-            test_type = st.selectbox(
-                "Select Test Type:",
-                ["One-Sample T-Test", "Two-Sample T-Test", "Paired T-Test", "ANOVA", "Chi-Square Test", "Mann-Whitney U", "Kruskal-Wallis"]
-            )
-            
-            numeric_cols = current_df.select_dtypes(include=[np.number]).columns.tolist()
-            categorical_cols = current_df.select_dtypes(include=['object', 'category']).columns.tolist()
-            
-            st.markdown("---")
-            
-            if test_type == "One-Sample T-Test":
-                st.write("**One-Sample T-Test**: Compare sample mean to a hypothesized population mean")
-                
-                if numeric_cols:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        test_col = st.selectbox("Select column:", numeric_cols, key="onesamp_col")
-                    with col2:
-                        pop_mean = st.number_input("Hypothesized population mean:", value=0.0)
-                    
-                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="onesamp_alpha")
-                    
-                    if st.button("Run One-Sample T-Test", type="primary"):
-                        result = st.session_state.stat_analyzer.one_sample_ttest(
-                            current_df[test_col], pop_mean, alpha
-                        )
-                        
-                        if 'error' not in result:
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("Sample Mean", f"{result['sample_mean']:.4f}")
-                            with col2:
-                                st.metric("t-Statistic", f"{result['t_statistic']:.4f}")
-                            with col3:
-                                st.metric("p-Value", f"{result['p_value']:.6f}")
-                            with col4:
-                                st.metric("Cohen's d", f"{result['cohens_d']:.4f}")
-                            
-                            if result['reject_null']:
-                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                            else:
-                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                            
-                            st.caption(f"Effect size: {result['effect_size_interpretation']}")
-                        else:
-                            st.error(result['error'])
-                else:
-                    st.warning("No numeric columns available")
-            
-            elif test_type == "Two-Sample T-Test":
-                st.write("**Two-Sample T-Test**: Compare means between two independent groups")
-                
-                if numeric_cols and categorical_cols:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="twosamp_val")
-                    with col2:
-                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="twosamp_grp")
-                    
-                    groups = current_df[group_col].dropna().unique()
-                    if len(groups) >= 2:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            group1 = st.selectbox("Group 1:", groups, key="twosamp_g1")
-                        with col2:
-                            group2 = st.selectbox("Group 2:", [g for g in groups if g != group1], key="twosamp_g2")
-                        
-                        equal_var = st.checkbox("Assume equal variances (unchecked = Welch's t-test)", value=False)
-                        alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="twosamp_alpha")
-                        
-                        if st.button("Run Two-Sample T-Test", type="primary"):
-                            g1_data = current_df[current_df[group_col] == group1][value_col]
-                            g2_data = current_df[current_df[group_col] == group2][value_col]
-                            
-                            result = st.session_state.stat_analyzer.two_sample_ttest(
-                                g1_data, g2_data, alpha, equal_var
-                            )
-                            
-                            if 'error' not in result:
-                                col1, col2, col3, col4 = st.columns(4)
-                                with col1:
-                                    st.metric(f"Mean ({group1})", f"{result['group1_mean']:.4f}")
-                                with col2:
-                                    st.metric(f"Mean ({group2})", f"{result['group2_mean']:.4f}")
-                                with col3:
-                                    st.metric("t-Statistic", f"{result['t_statistic']:.4f}")
-                                with col4:
-                                    st.metric("p-Value", f"{result['p_value']:.6f}")
-                                
-                                if result['reject_null']:
-                                    st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                                else:
-                                    st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                                
-                                st.caption(f"Effect size (Cohen's d = {result['cohens_d']:.4f}): {result['effect_size_interpretation']}")
-                                
-                                # Levene's test info
-                                levene = result['levene_test']
-                                if not levene['equal_variances']:
-                                    st.warning(f"⚠️ Levene's test suggests unequal variances (p = {levene['p_value']:.4f}). Consider using Welch's t-test.")
-                            else:
-                                st.error(result['error'])
-                    else:
-                        st.warning("Need at least 2 groups for comparison")
-                else:
-                    st.warning("Need numeric and categorical columns for comparison")
-            
-            elif test_type == "Paired T-Test":
-                st.write("**Paired T-Test**: Compare means from related samples (before/after)")
-                
-                if len(numeric_cols) >= 2:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        before_col = st.selectbox("Before/First measurement:", numeric_cols, key="paired_before")
-                    with col2:
-                        after_col = st.selectbox("After/Second measurement:", [c for c in numeric_cols if c != before_col], key="paired_after")
-                    
-                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="paired_alpha")
-                    
-                    if st.button("Run Paired T-Test", type="primary"):
-                        result = st.session_state.stat_analyzer.paired_ttest(
-                            current_df[before_col], current_df[after_col], alpha
-                        )
-                        
-                        if 'error' not in result:
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("Before Mean", f"{result['before_mean']:.4f}")
-                            with col2:
-                                st.metric("After Mean", f"{result['after_mean']:.4f}")
-                            with col3:
-                                st.metric("Mean Difference", f"{result['mean_difference']:.4f}")
-                            with col4:
-                                st.metric("p-Value", f"{result['p_value']:.6f}")
-                            
-                            if result['reject_null']:
-                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                            else:
-                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                        else:
-                            st.error(result['error'])
-                else:
-                    st.warning("Need at least 2 numeric columns for paired test")
-            
-            elif test_type == "ANOVA":
-                st.write("**One-Way ANOVA**: Compare means across multiple groups")
-                
-                if numeric_cols and categorical_cols:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="anova_val")
-                    with col2:
-                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="anova_grp")
-                    
-                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="anova_alpha")
-                    
-                    if st.button("Run ANOVA", type="primary"):
-                        result = st.session_state.stat_analyzer.one_way_anova(
-                            current_df, value_col, group_col, alpha
-                        )
-                        
-                        if 'error' not in result:
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("F-Statistic", f"{result['f_statistic']:.4f}")
-                            with col2:
-                                st.metric("p-Value", f"{result['p_value']:.6f}")
-                            with col3:
-                                st.metric("η² (Eta-squared)", f"{result['eta_squared']:.4f}")
-                            
-                            if result['reject_null']:
-                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                            else:
-                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                            
-                            st.caption(f"Effect size: {result['effect_size_interpretation']}")
-                            
-                            # Group statistics
-                            st.subheader("Group Statistics")
-                            st.dataframe(pd.DataFrame(result['group_statistics']), use_container_width=True)
-                        else:
-                            st.error(result['error'])
-                else:
-                    st.warning("Need numeric and categorical columns for ANOVA")
-            
-            elif test_type == "Chi-Square Test":
-                st.write("**Chi-Square Test of Independence**: Test association between categorical variables")
-                
-                if len(categorical_cols) >= 2:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        cat1 = st.selectbox("First categorical variable:", categorical_cols, key="chi_cat1")
-                    with col2:
-                        cat2 = st.selectbox("Second categorical variable:", [c for c in categorical_cols if c != cat1], key="chi_cat2")
-                    
-                    alpha = st.slider("Significance level (α):", 0.01, 0.10, 0.05, 0.01, key="chi_alpha")
-                    
-                    if st.button("Run Chi-Square Test", type="primary"):
-                        result = st.session_state.stat_analyzer.chi_square_independence(
-                            current_df, cat1, cat2, alpha
-                        )
-                        
-                        if 'error' not in result:
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("χ² Statistic", f"{result['chi_square_statistic']:.4f}")
-                            with col2:
-                                st.metric("p-Value", f"{result['p_value']:.6f}")
-                            with col3:
-                                st.metric("Cramér's V", f"{result['cramers_v']:.4f}")
-                            
-                            if result['reject_null']:
-                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                            else:
-                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                            
-                            st.caption(f"Effect size: {result['effect_size_interpretation']}")
-                        else:
-                            st.error(result['error'])
-                else:
-                    st.warning("Need at least 2 categorical columns for chi-square test")
-            
-            elif test_type == "Mann-Whitney U":
-                st.write("**Mann-Whitney U Test**: Non-parametric alternative to two-sample t-test")
-                
-                if numeric_cols and categorical_cols:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="mwu_val")
-                    with col2:
-                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="mwu_grp")
-                    
-                    groups = current_df[group_col].dropna().unique()
-                    if len(groups) >= 2:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            group1 = st.selectbox("Group 1:", groups, key="mwu_g1")
-                        with col2:
-                            group2 = st.selectbox("Group 2:", [g for g in groups if g != group1], key="mwu_g2")
-                        
-                        if st.button("Run Mann-Whitney U Test", type="primary"):
-                            g1_data = current_df[current_df[group_col] == group1][value_col]
-                            g2_data = current_df[current_df[group_col] == group2][value_col]
-                            
-                            result = st.session_state.stat_analyzer.mann_whitney_u(g1_data, g2_data)
-                            
-                            if 'error' not in result:
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("U Statistic", f"{result['u_statistic']:.4f}")
-                                with col2:
-                                    st.metric("p-Value", f"{result['p_value']:.6f}")
-                                with col3:
-                                    st.metric("Rank-Biserial r", f"{result['rank_biserial_r']:.4f}")
-                                
-                                if result['reject_null']:
-                                    st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                                else:
-                                    st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                            else:
-                                st.error(result['error'])
-                else:
-                    st.warning("Need numeric and categorical columns for Mann-Whitney U test")
-            
-            elif test_type == "Kruskal-Wallis":
-                st.write("**Kruskal-Wallis H Test**: Non-parametric alternative to one-way ANOVA")
-                
-                if numeric_cols and categorical_cols:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        value_col = st.selectbox("Select numeric column:", numeric_cols, key="kw_val")
-                    with col2:
-                        group_col = st.selectbox("Select grouping column:", categorical_cols, key="kw_grp")
-                    
-                    if st.button("Run Kruskal-Wallis Test", type="primary"):
-                        result = st.session_state.stat_analyzer.kruskal_wallis(
-                            current_df, value_col, group_col
-                        )
-                        
-                        if 'error' not in result:
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.metric("H Statistic", f"{result['h_statistic']:.4f}")
-                            with col2:
-                                st.metric("p-Value", f"{result['p_value']:.6f}")
-                            
-                            if result['reject_null']:
-                                st.success(f"✅ **Reject H₀**: {result['interpretation']}")
-                            else:
-                                st.info(f"ℹ️ **Fail to Reject H₀**: {result['interpretation']}")
-                            
-                            st.subheader("Group Statistics (Medians)")
-                            st.dataframe(pd.DataFrame(result['group_statistics']), use_container_width=True)
-                        else:
-                            st.error(result['error'])
-                else:
-                    st.warning("Need numeric and categorical columns for Kruskal-Wallis test")
         
         # =============================================
         # TAB 5: OUTLIER DETECTION
@@ -2134,10 +2922,14 @@ elif page == "prediction":
     st.markdown("---")
     
     # Lazy import — only loaded when user visits this page
-    from src.analytics.ml_models import MLModels
+    from src.analytics.ml_models import MLModels, SmartCategoricalEncoder
 
     # Initialize ML models if not already done
-    if 'ml_models' not in st.session_state or st.session_state.ml_models is None:
+    if (
+        'ml_models' not in st.session_state
+        or st.session_state.ml_models is None
+        or getattr(st.session_state.ml_models, 'api_version', 0) < 2
+    ):
         st.session_state.ml_models = MLModels()
     
     # Add tabs for Training and Prediction
@@ -2180,6 +2972,17 @@ elif page == "prediction":
             )
             
             current_df = dataset_options[selected_dataset]
+            training_df = current_df
+            raw_training_df = None
+            categorical_preprocessor = None
+
+            if selected_dataset == "Encoded Data" and st.session_state.df_cleaned is not None:
+                raw_training_df = st.session_state.df_cleaned.copy()
+                categorical_preprocessor = SmartCategoricalEncoder()
+            if selected_dataset == "Encoded Data" and raw_training_df is not None:
+                st.caption(
+                    "This run will also fit and save a raw-to-prediction pipeline so inference matches training."
+                )
             st.info(f"Using {selected_dataset} for regression: {current_df.shape[0]:,} rows × {current_df.shape[1]} columns")
             
             # Target Selection Section - FIXED
@@ -2246,7 +3049,45 @@ elif page == "prediction":
                 
                 # ML Configuration - SIMPLIFIED
                 st.subheader("⚙️ Regression Configuration")
-                st.info("🤖 We will use GridSearchCV to find the best parameters for each regression model.")
+                all_regression_models = list(st.session_state.ml_models.get_regression_models().keys())
+                training_scope = st.radio(
+                    "Choose model training scope:",
+                    ["Train all available models", "Train specific selected models"],
+                    horizontal=True,
+                    key="regression_training_scope",
+                )
+
+                if training_scope == "Train all available models":
+                    selected_models = all_regression_models
+                    search_strategy = "random"
+                    strategy_label = "RandomizedSearchCV"
+                    st.info(
+                        "🤖 Training all available regression models uses RandomizedSearchCV to keep tuning responsive."
+                    )
+                else:
+                    selected_models = st.multiselect(
+                        "Select regression models to train:",
+                        options=all_regression_models,
+                        default=all_regression_models[:2],
+                        key="selected_regression_models",
+                    )
+
+                    if not selected_models:
+                        search_strategy = None
+                        strategy_label = None
+                        st.warning("Select at least one regression model to continue.")
+                    elif len(selected_models) <= 2:
+                        search_strategy = "grid"
+                        strategy_label = "GridSearchCV"
+                        st.info(
+                            "🤖 With two or fewer selected models, the app uses GridSearchCV for exhaustive tuning."
+                        )
+                    else:
+                        search_strategy = "random"
+                        strategy_label = "RandomizedSearchCV"
+                        st.info(
+                            "🤖 With more than two selected models, the app switches to RandomizedSearchCV for faster exploration."
+                        )
                 
                 col1, col2, col3 = st.columns(3)
                 
@@ -2259,30 +3100,45 @@ elif page == "prediction":
                 with col3:
                     st.metric("Cross-Validation", "5-fold", help="Automatically set to 5-fold CV")
                 
+                remove_all_zero_rows = st.checkbox(
+                    "Supprimer automatiquement les lignes entièrement remplies de zéros avant l'entraînement",
+                    value=False,
+                    key="regression_drop_all_zero_rows",
+                    help="Supprime uniquement les lignes dont toutes les valeurs sont égales à 0 avant le pipeline de standardisation et d'entraînement.",
+                )
+
+                if False and remove_all_zero_rows:
+                    _, all_zero_row_count = st.session_state.ml_models.remove_all_zero_rows(training_df)
+                    st.caption(
+                        f"Lignes entièrement à zéro détectées dans le dataset d'entraînement : {all_zero_row_count}"
+                    )
+                
                 with st.expander("🔧 Regression Models to be Tuned", expanded=False):
-                    models_info = """
-                    **Linear Models:**
-                    - Linear Regression (fit_intercept)
-                    - Ridge Regression (alpha, solver)
-                    - Lasso Regression (alpha, selection)  
-                    
-                    **Tree-based Models:**
-                    - Random Forest Regressor (n_estimators, max_depth)
-                    - Gradient Boosting Regressor (learning_rate, n_estimators)
-                    
-                    *All models will undergo hyperparameter optimization.*
-                    """
-                    st.markdown(models_info)
+                    st.write("Selected models:")
+                    for model_name in selected_models:
+                        st.write(f"- {model_name}")
+
+                    if selected_models and strategy_label:
+                        st.caption(
+                            f"Hyperparameter strategy: {strategy_label}. "
+                            f"{'All available models are included.' if training_scope == 'Train all available models' else 'The strategy adapts to the number of selected models.'}"
+                        )
                 
                 st.markdown("---")
                 
                 # Run ML Pipeline - FIXED
                 if st.button("🚀 Run Automated Regression Pipeline", use_container_width=True, type="primary"):
+                    if not selected_models or not search_strategy:
+                        st.warning("Select at least one regression model before running the pipeline.")
+                        st.stop()
+
                     # Create progress tracking
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    with st.spinner("🤖 Running automated regression pipeline with hyperparameter tuning..."):
+                    with st.spinner(
+                        f"🤖 Running automated regression pipeline with {strategy_label} hyperparameter tuning..."
+                    ):
                         try:
                             # Update progress
                             status_text.text("🔄 Preparing data for regression...")
@@ -2298,12 +3154,17 @@ elif page == "prediction":
                             
                             # Run the complete regression pipeline
                             results = st.session_state.ml_models.full_regression_pipeline(
-                                df=current_df,
+                                df=training_df,
                                 target_column=target_column,
                                 correlation_threshold=0.01,
                                 test_size=0.2,
                                 cv_folds=5,
-                                save_model=True
+                                save_model=True,
+                                selected_models=selected_models,
+                                search_strategy=search_strategy,
+                                random_search_iterations=10,
+                                raw_input_df=raw_training_df,
+                                categorical_preprocessor=categorical_preprocessor,
                             )
                             
                             # Update progress
@@ -2312,6 +3173,7 @@ elif page == "prediction":
                             
                             # Store results
                             st.session_state.ml_results = results
+                            st.session_state.model_diagnostics_cache = {}
                             st.session_state.selected_target = target_column
                             st.session_state.selected_dataset = selected_dataset
                             
@@ -2481,46 +3343,144 @@ elif page == "prediction":
                         st.plotly_chart(fig, use_container_width=True)
                 
                 with result_tabs[3]:
-                    st.write("### 📊 Prediction Analysis")
-                    
-                    if 'test_metrics' in results and 'predictions' in results['test_metrics']:
-                        predictions = results['test_metrics']['predictions']
-                        actual = st.session_state.ml_models.y_test
-                        
-                        # Prediction vs Actual scatter plot
-                        fig_scatter = px.scatter(
-                            x=actual, 
-                            y=predictions,
-                            labels={'x': 'Actual Values', 'y': 'Predicted Values'},
-                            title="Predicted vs Actual Values"
+                    st.write("### ?? Prediction Analysis")
+
+                    if 'model_scores' in results and results['model_scores']:
+                        trained_model_names = list(results['model_scores'].keys())
+                        current_default_model = results.get('best_model_name', trained_model_names[0])
+
+                        st.info(
+                            f"Default selection: `{current_default_model}` is currently used as the best model. "
+                            "Use the selector below to explore every trained model, and override the default if another one looks more robust."
                         )
-                        
-                        # Add perfect prediction line
-                        min_val = min(min(actual), min(predictions))
-                        max_val = max(max(actual), max(predictions))
-                        fig_scatter.add_trace(
-                            go.Scatter(
-                                x=[min_val, max_val], 
-                                y=[min_val, max_val],
-                                mode='lines',
-                                name='Perfect Prediction',
-                                line=dict(color='red', dash='dash')
+
+                        selected_analysis_model = st.selectbox(
+                            "Select a trained model to analyze:",
+                            options=trained_model_names,
+                            index=trained_model_names.index(current_default_model),
+                            key="prediction_analysis_model_selector",
+                        )
+
+                        selected_model_info = results['model_scores'][selected_analysis_model]
+                        selected_metrics = (
+                            results.get('all_test_metrics', {}).get(selected_analysis_model)
+                            or results.get('test_metrics', {})
+                        )
+
+                        overview_col, action_col = st.columns([3, 2])
+                        with overview_col:
+                            render_regression_metric_cards(selected_metrics)
+                        with action_col:
+                            st.write("**Selection Status**")
+                            st.write(f"- Default best model: {current_default_model}")
+                            st.write(f"- Analyzing: {selected_analysis_model}")
+                            st.write(
+                                f"- Search strategy: {selected_model_info.get('search_strategy', results.get('training_summary', {}).get('search_strategy', 'N/A'))}"
                             )
-                        )
-                        
-                        st.plotly_chart(fig_scatter, use_container_width=True)
-                        
-                        # Residuals plot
-                        residuals = results['test_metrics']['residuals']
-                        fig_residuals = px.scatter(
-                            x=predictions,
-                            y=residuals,
-                            labels={'x': 'Predicted Values', 'y': 'Residuals'},
-                            title="Residuals Plot"
-                        )
-                        fig_residuals.add_hline(y=0, line_dash="dash", line_color="red")
-                        st.plotly_chart(fig_residuals, use_container_width=True)
-                
+
+                            if selected_analysis_model != current_default_model:
+                                if st.button(
+                                    f"Use {selected_analysis_model} for prediction/export",
+                                    key=f"override_model_{selected_analysis_model}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state.ml_models.set_active_model(
+                                        selected_analysis_model,
+                                        results['model_scores'],
+                                    )
+                                    results['best_model_name'] = selected_analysis_model
+                                    results['best_model'] = results['model_scores'][selected_analysis_model]['model']
+                                    results['best_score'] = results['model_scores'][selected_analysis_model]['mean_score']
+                                    if 'all_test_metrics' in results and selected_analysis_model in results['all_test_metrics']:
+                                        results['test_metrics'] = results['all_test_metrics'][selected_analysis_model]
+                                    results['feature_importance'] = st.session_state.ml_models.get_feature_importance(
+                                        model=results['best_model'],
+                                        feature_names=st.session_state.ml_models.feature_names,
+                                    )
+                                    results['training_summary']['best_model'] = selected_analysis_model
+                                    results['training_summary']['best_score'] = results['best_score']
+                                    st.session_state.ml_results = results
+                                    st.session_state.ml_models.save_model_and_preprocessors()
+                                    st.success(f"{selected_analysis_model} is now the active model for predictions and bundle export.")
+                                    st.rerun()
+                            else:
+                                st.success("Current default best model is selected.")
+
+                        comparison_rows = []
+                        for model_name, metrics in results.get('all_test_metrics', {}).items():
+                            comparison_rows.append({
+                                'Model': model_name,
+                                'R? Test': round(metrics.get('r2_score', 0), 4),
+                                'RMSE Test': round(metrics.get('rmse', 0), 4),
+                                'MAE Test': round(metrics.get('mae', 0), 4),
+                                'MAPE Test (%)': round(metrics.get('mape', 0), 2),
+                                'Default Best': model_name == current_default_model,
+                            })
+                        if comparison_rows:
+                            st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True)
+
+                        predictions = selected_metrics.get('predictions')
+                        actual = st.session_state.ml_models.y_test
+                        if predictions is not None and actual is not None:
+                            actual_series = actual.reset_index(drop=True) if hasattr(actual, 'reset_index') else pd.Series(actual)
+                            prediction_series = pd.Series(predictions)
+
+                            fig_scatter = px.scatter(
+                                x=actual_series,
+                                y=prediction_series,
+                                labels={'x': 'Actual Values', 'y': 'Predicted Values'},
+                                title=f"Predicted vs Actual Values - {selected_analysis_model}"
+                            )
+
+                            min_val = min(actual_series.min(), prediction_series.min())
+                            max_val = max(actual_series.max(), prediction_series.max())
+                            fig_scatter.add_trace(
+                                go.Scatter(
+                                    x=[min_val, max_val],
+                                    y=[min_val, max_val],
+                                    mode='lines',
+                                    name='Perfect Prediction',
+                                    line=dict(color='red', dash='dash')
+                                )
+                            )
+
+                            st.plotly_chart(fig_scatter, use_container_width=True)
+
+                            residual_series = pd.Series(selected_metrics.get('residuals'))
+                            fig_residuals = px.scatter(
+                                x=prediction_series,
+                                y=residual_series,
+                                labels={'x': 'Predicted Values', 'y': 'Residuals'},
+                                title=f"Residuals Plot - {selected_analysis_model}"
+                            )
+                            fig_residuals.add_hline(y=0, line_dash="dash", line_color="red")
+                            st.plotly_chart(fig_residuals, use_container_width=True)
+
+                        cache_key = f"{selected_dataset}::{selected_analysis_model}"
+                        if cache_key not in st.session_state.model_diagnostics_cache:
+                            with st.spinner(f"Generating diagnostic curves for {selected_analysis_model}..."):
+                                st.session_state.model_diagnostics_cache[cache_key] = (
+                                    st.session_state.ml_models.compile_model_diagnostics(
+                                        selected_analysis_model,
+                                        selected_model_info,
+                                        cv_folds=results.get('training_summary', {}).get('cv_folds', 5),
+                                    )
+                                )
+
+                        diagnostics = st.session_state.model_diagnostics_cache.get(cache_key, {})
+                        render_learning_curve_chart(diagnostics.get('learning_curve'), selected_analysis_model)
+
+                        validation_curve = diagnostics.get('validation_curve')
+                        if validation_curve:
+                            render_validation_curve_chart(validation_curve, selected_analysis_model)
+
+                        iteration_history = diagnostics.get('iteration_history')
+                        if iteration_history:
+                            render_iteration_history_chart(iteration_history, selected_analysis_model)
+
+                        if not validation_curve and selected_analysis_model == 'Linear Regression':
+                            st.caption("Linear Regression exposes only the learning curve because it has no regularization hyperparameter or iterative training history.")
+
                 with result_tabs[4]:
                     st.write("### 📋 Training Summary")
                     
@@ -2536,6 +3496,8 @@ elif page == "prediction":
                             st.write(f"- Final Features: {summary.get('final_features', 'N/A')}")
                             st.write(f"- Train Size: {summary.get('train_size', 'N/A')}")
                             st.write(f"- Test Size: {summary.get('test_size', 'N/A')}")
+                            st.write(f"- All-Zero Row Filter: {'Enabled' if summary.get('drop_all_zero_rows') else 'Disabled'}")
+                            st.write(f"- Removed All-Zero Rows: {summary.get('removed_all_zero_rows', 0)}")
                         
                         with col2:
                             st.write("**Model Information:**")
@@ -2552,9 +3514,9 @@ elif page == "prediction":
     # ===========================================
     with main_tabs[1]:
         st.subheader("🔮 Predict on New Data")
-        st.markdown("Upload a trained model bundle and a new dataset to generate predictions.")
+        st.markdown("Upload a trained model and a new dataset. The fitted TargetEncoder is loaded automatically from Streamlit cache after preprocessing.")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             st.info("1️⃣ Upload Model Bundle")
@@ -2572,6 +3534,10 @@ elif page == "prediction":
                 
                 try:
                     if st.session_state.ml_models.load_model_from_zip(model_path):
+                        st.session_state.loaded_prediction_model = (
+                            st.session_state.ml_models.full_prediction_pipeline
+                            or st.session_state.ml_models.best_model
+                        )
                         st.success(f"✅ Model loaded: {st.session_state.ml_models.best_model_name}")
                         st.write(f"**Target:** {st.session_state.ml_models.target_column}")
                         st.write(f"**Best R²:** {st.session_state.ml_models.best_score:.4f}")
@@ -2583,12 +3549,35 @@ elif page == "prediction":
                     st.error(f"Error: {e}")
                 finally:
                     os.unlink(model_path)
+
+            uploaded_direct_model = st.file_uploader(
+                "Or upload a direct model artifact (.pkl/.joblib)",
+                type=['pkl', 'joblib'],
+                key="direct_model_uploader"
+            )
+
+            if uploaded_direct_model:
+                model_suffix = os.path.splitext(uploaded_direct_model.name)[1] or ".pkl"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=model_suffix) as tmp_file:
+                    tmp_file.write(uploaded_direct_model.getvalue())
+                    direct_model_path = tmp_file.name
+
+                try:
+                    st.session_state.loaded_prediction_model = joblib.load(direct_model_path)
+                    st.session_state.model_loaded = True
+                    st.success("✅ Direct model artifact loaded successfully.")
+                except Exception as e:
+                    st.session_state.loaded_prediction_model = None
+                    st.session_state.model_loaded = False
+                    st.error(f"Error loading direct model artifact: {e}")
+                finally:
+                    os.unlink(direct_model_path)
         
         with col2:
             st.info("2️⃣ Upload New Data")
             uploaded_data = st.file_uploader(
                 "Upload new dataset (CSV/Excel)",
-                type=['csv', 'xlsx'],
+                type=['csv', 'xlsx', 'xlsm'],
                 key="prediction_data_uploader"
             )
             
@@ -2607,26 +3596,117 @@ elif page == "prediction":
                 finally:
                     os.unlink(data_path)
 
+        with col3:
+            st.info("3️⃣ Load Fitted TargetEncoder")
+            uploaded_encoder = st.file_uploader(
+                "Upload 'target_encoder.pkl' or reuse the encoder saved in this session",
+                type=['pkl', 'joblib'],
+                key="target_encoder_uploader"
+            )
+
+            if uploaded_encoder:
+                encoder_suffix = os.path.splitext(uploaded_encoder.name)[1] or ".pkl"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=encoder_suffix) as tmp_file:
+                    tmp_file.write(uploaded_encoder.getvalue())
+                    encoder_path = tmp_file.name
+
+                try:
+                    st.session_state.loaded_target_encoder = joblib.load(encoder_path)
+                    st.success("✅ Fitted TargetEncoder loaded successfully.")
+                except Exception as e:
+                    st.session_state.loaded_target_encoder = None
+                    st.error(f"Error loading encoder: {e}")
+                finally:
+                    os.unlink(encoder_path)
+            elif st.session_state.get('target_encoder_bytes'):
+                try:
+                    st.session_state.loaded_target_encoder = joblib.load(
+                        BytesIO(st.session_state.target_encoder_bytes)
+                    )
+                    st.success("✅ Using fitted TargetEncoder saved from the Data Preprocessing section.")
+                    encoded_columns = st.session_state.get('target_encoder_columns', [])
+                    if encoded_columns:
+                        st.write(f"**Encoded columns:** {', '.join(encoded_columns)}")
+                except Exception as e:
+                    st.session_state.loaded_target_encoder = None
+                    st.error(f"Error restoring session TargetEncoder: {e}")
+
+            if st.session_state.get('target_encoder_bytes'):
+                try:
+                    st.session_state.loaded_target_encoder = load_cached_target_encoder(
+                        st.session_state.target_encoder_bytes
+                    )
+                    encoded_columns = st.session_state.get('target_encoder_columns', [])
+                    st.info("Cached TargetEncoder from Data Preprocessing will be used automatically for prediction.")
+                    if encoded_columns:
+                        st.caption(f"Cached encoded columns: {', '.join(encoded_columns)}")
+                except Exception as e:
+                    st.session_state.loaded_target_encoder = None
+                    st.error(f"Error restoring cached TargetEncoder: {e}")
+
         st.markdown("---")
         
         # Predict Button
-        if st.session_state.get('model_loaded') and st.session_state.get('new_prediction_df') is not None:
+        if (
+            st.session_state.get('model_loaded')
+            and st.session_state.get('new_prediction_df') is not None
+            and st.session_state.get('loaded_prediction_model') is not None
+        ):
             if st.button("🔮 Generate Predictions", type="primary", use_container_width=True):
                 with st.spinner("Generating predictions..."):
                     try:
-                        predictions = st.session_state.ml_models.predict_new_data(st.session_state.new_prediction_df)
+                        new_data = st.session_state.new_prediction_df.copy()
+                        loaded_model = st.session_state.loaded_prediction_model
+
+                        if loaded_model is None:
+                            raise ValueError("No trained model artifact is currently loaded.")
+
+                        target_col = st.session_state.ml_models.target_column
+                        if target_col and target_col in new_data.columns:
+                            new_data = new_data.drop(columns=[target_col])
+
+                        if hasattr(loaded_model, 'named_steps') and 'model' in loaded_model.named_steps:
+                            predictions = loaded_model.predict(new_data)
+                        else:
+                            from sklearn.pipeline import Pipeline
+                            from sklearn.preprocessing import FunctionTransformer
+
+                            loaded_encoder = st.session_state.loaded_target_encoder
+                            if loaded_encoder is None:
+                                raise ValueError(
+                                    "This model bundle requires the cached TargetEncoder, but none is available."
+                                )
+
+                            new_data = ensure_encoder_input_columns(new_data, loaded_encoder)
+                            expected_feature_names = st.session_state.ml_models.feature_names or []
+
+                            prediction_pipeline = Pipeline(
+                                steps=[
+                                    ('encoder', loaded_encoder),
+                                    (
+                                        'align_features',
+                                        FunctionTransformer(
+                                            align_prediction_features,
+                                            kw_args={'expected_features': expected_feature_names},
+                                            validate=False,
+                                        ),
+                                    ),
+                                    ('model', loaded_model),
+                                ]
+                            )
+                            predictions = prediction_pipeline.predict(new_data)
                         
                         if predictions is not None:
                             # Add predictions to the ORIGINAL dataframe (including target if present)
                             result_df = st.session_state.new_prediction_df.copy()
-                            target_col = st.session_state.ml_models.target_column
-                            prediction_col = f"Predicted_{target_col}"
+                            prediction_target = target_col or "target"
+                            prediction_col = f"Predicted_{prediction_target}"
                             result_df[prediction_col] = predictions
                             
                             # Store in session state so results survive reruns
                             st.session_state.prediction_result_df = result_df
                             st.session_state.prediction_col_name = prediction_col
-                            st.session_state.prediction_target_col = target_col
+                            st.session_state.prediction_target_col = prediction_target
                             
                             st.success("✅ Predictions generated successfully!")
                         else:
@@ -2635,8 +3715,12 @@ elif page == "prediction":
                     except Exception as e:
                         st.error(f"Error generating predictions: {str(e)}")
                         st.exception(e)
-        elif not st.session_state.get('model_loaded') or st.session_state.get('new_prediction_df') is None:
-            st.info("👈 Upload both a model and a dataset to start.")
+        elif (
+            not st.session_state.get('model_loaded')
+            or st.session_state.get('loaded_prediction_model') is None
+            or st.session_state.get('new_prediction_df') is None
+        ):
+            st.info("👈 Upload a model bundle and a dataset to start predictions.")
         
         # Display prediction results (persisted in session state)
         if st.session_state.get('prediction_result_df') is not None:

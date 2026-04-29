@@ -101,6 +101,63 @@ class DataTransformer:
 
         return df_encoded
 
+    def fit_target_encoder(
+        self,
+        df: pd.DataFrame,
+        target_col: str,
+        high_card_threshold: int = 10,
+        drop_threshold: float = 0.9,
+    ):
+        """
+        Fit a reusable TargetEncoder on high-cardinality categorical columns.
+
+        This mirrors the target-encoding portion of smart_categorical_encoding
+        so the fitted encoder can be saved and reused later during inference.
+        """
+        df_standardized = standardize_columns(df)
+
+        if target_col not in df_standardized.columns:
+            raise ValueError(f"Target column '{target_col}' not found in dataframe.")
+
+        categorical_columns = df_standardized.select_dtypes(
+            include=["object", "category"]
+        ).columns.tolist()
+        target_encode_columns: list[str] = []
+
+        for column in categorical_columns:
+            if column == target_col:
+                continue
+
+            unique_count = df_standardized[column].nunique(dropna=True)
+            total_count = len(df_standardized[column].dropna())
+            unique_ratio = unique_count / total_count if total_count > 0 else 0.0
+
+            if unique_ratio > drop_threshold:
+                continue
+
+            if unique_count > high_card_threshold:
+                target_encode_columns.append(column)
+
+        if not target_encode_columns:
+            return None, []
+
+        import category_encoders as ce
+
+        X = df_standardized.drop(columns=[target_col]).copy()
+        y = df_standardized[target_col].copy()
+
+        if y.isna().any():
+            y = y.fillna(y.mean())
+
+        encoder = ce.TargetEncoder(
+            cols=target_encode_columns,
+            handle_missing="value",
+            handle_unknown="value",
+        )
+        encoder.fit(X, y)
+
+        return encoder, target_encode_columns
+
     def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Merge date/time columns into a single datetime feature when possible."""
         logger.info("Starting data transformation")

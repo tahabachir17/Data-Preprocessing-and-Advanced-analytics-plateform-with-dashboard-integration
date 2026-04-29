@@ -34,7 +34,7 @@ DEBUG = ENV == "development"
 # File Upload
 # ───────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
-ALLOWED_EXTENSIONS = {"csv", "xlsx", "xls"}
+ALLOWED_EXTENSIONS = {"csv", "xlsx", "xls", "xlsm"}
 
 # ───────────────────────────────────────────────────
 # Data Processing Defaults

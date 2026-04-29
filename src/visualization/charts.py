@@ -13,7 +13,100 @@ logger = logging.getLogger(__name__)
 class DataVisualizer:
     def __init__(self):
         self.color_palette = px.colors.qualitative.Set3
+        self.max_scatter_points = 5000
+        self.max_line_points = 3000
+        self.max_histogram_points = 15000
+        self.max_distribution_groups = 40
+        self.max_hover_columns = 6
         logger.info("DataVisualizer initialized")
+
+    def _get_hover_columns(self, df: pd.DataFrame, *priority_cols: Optional[str]) -> List[str]:
+        hover_columns: List[str] = []
+        for col in priority_cols:
+            if col and col in df.columns and col not in hover_columns:
+                hover_columns.append(col)
+
+        for col in df.columns:
+            if col not in hover_columns:
+                hover_columns.append(col)
+            if len(hover_columns) >= self.max_hover_columns:
+                break
+
+        return hover_columns
+
+    def _evenly_downsample(
+        self,
+        df: pd.DataFrame,
+        max_points: int,
+        sort_by: Optional[str] = None
+    ) -> pd.DataFrame:
+        if sort_by and sort_by in df.columns:
+            df = df.sort_values(sort_by, kind="mergesort")
+
+        if len(df) <= max_points:
+            return df
+
+        sample_idx = np.linspace(0, len(df) - 1, max_points, dtype=int)
+        return df.iloc[sample_idx].copy()
+
+    def _prepare_distribution_grouping(
+        self,
+        df: pd.DataFrame,
+        x_col: str
+    ) -> Tuple[pd.DataFrame, str]:
+        plot_df = df.copy()
+        unique_count = plot_df[x_col].nunique(dropna=True)
+
+        if unique_count <= self.max_distribution_groups:
+            return plot_df, x_col
+
+        grouped_col = f"{x_col}_grouped"
+        series = plot_df[x_col]
+
+        if pd.api.types.is_datetime64_any_dtype(series):
+            non_null = series.dropna().sort_values()
+            if non_null.empty:
+                plot_df[grouped_col] = "Missing"
+                return plot_df, grouped_col
+
+            span_seconds = max((non_null.iloc[-1] - non_null.iloc[0]).total_seconds(), 1)
+            target_bucket_seconds = span_seconds / self.max_distribution_groups
+
+            if target_bucket_seconds <= 3600:
+                freq = "H"
+                fmt = "%Y-%m-%d %H:00"
+            elif target_bucket_seconds <= 86400:
+                freq = "D"
+                fmt = "%Y-%m-%d"
+            elif target_bucket_seconds <= 604800:
+                freq = "W"
+                fmt = "%Y-%m-%d"
+            else:
+                freq = "M"
+                fmt = "%Y-%m"
+
+            grouped = series.dt.to_period(freq).dt.to_timestamp()
+            plot_df[grouped_col] = grouped.dt.strftime(fmt).fillna("Missing")
+            return plot_df, grouped_col
+
+        if pd.api.types.is_numeric_dtype(series):
+            non_null = series.dropna()
+            if non_null.empty:
+                plot_df[grouped_col] = "Missing"
+                return plot_df, grouped_col
+
+            bins = min(self.max_distribution_groups, max(non_null.nunique(), 1))
+            try:
+                plot_df[grouped_col] = pd.qcut(series, q=bins, duplicates="drop")
+            except ValueError:
+                plot_df[grouped_col] = pd.cut(series, bins=bins, duplicates="drop")
+            plot_df[grouped_col] = plot_df[grouped_col].astype(str).fillna("Missing")
+            return plot_df, grouped_col
+
+        top_values = series.value_counts(dropna=True).nlargest(self.max_distribution_groups - 1).index
+        plot_df[grouped_col] = np.where(series.isin(top_values), series.astype(str), "Other")
+        plot_df[grouped_col] = plot_df[grouped_col].fillna("Missing")
+        return plot_df, grouped_col
     
     def get_plot_suggestions(self, df: pd.DataFrame, x_col: str, y_col: str) -> List[str]:
         """Suggest appropriate plot types based on data types"""
@@ -30,20 +123,28 @@ class DataVisualizer:
         x_unique = df[x_col].nunique()
         y_unique = df[y_col].nunique()
         
+        # Time series should take precedence over categorical distribution suggestions.
+        if (x_is_datetime and y_is_numeric) or (y_is_datetime and x_is_numeric):
+            suggestions.extend(["Time Series Plot", "Line Plot", "Scatter Plot"])
+
         # Both numeric
-        if x_is_numeric and y_is_numeric:
+        elif x_is_numeric and y_is_numeric:
             suggestions.extend(["Scatter Plot", "Line Plot", "Area Plot"])
             if len(df) < 1000:
                 suggestions.append("Bubble Plot")
         
         # One categorical, one numeric
-        elif (x_is_numeric and not y_is_numeric) or (not x_is_numeric and y_is_numeric):
-            suggestions.extend(["Bar Plot", "Box Plot", "Violin Plot"])
+        elif (x_is_numeric and not y_is_numeric and not y_is_datetime) or (
+            not x_is_numeric and not x_is_datetime and y_is_numeric
+        ):
+            suggestions.extend(["Bar Plot", "Box Plot"])
+            if x_unique <= self.max_distribution_groups or y_unique <= self.max_distribution_groups:
+                suggestions.append("Violin Plot")
             if x_unique <= 20 or y_unique <= 20:
                 suggestions.append("Strip Plot")
         
         # Both categorical
-        elif not x_is_numeric and not y_is_numeric:
+        elif not x_is_numeric and not y_is_numeric and not x_is_datetime and not y_is_datetime:
             suggestions.extend(["Bar Plot", "Heatmap"])
             if x_unique <= 10 and y_unique <= 10:
                 suggestions.append("Contingency Heatmap")
@@ -63,13 +164,17 @@ class DataVisualizer:
                            title: Optional[str] = None) -> go.Figure:
         """Create an interactive scatter plot"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, y_col, color_col, size_col)
+            plot_df = self._evenly_downsample(df[plot_columns].dropna(subset=[x_col, y_col]), self.max_scatter_points)
+            render_mode = "webgl" if len(plot_df) > 1500 else "svg"
             fig = px.scatter(
-                df, x=x_col, y=y_col,
+                plot_df, x=x_col, y=y_col,
                 color=color_col,
                 size=size_col,
                 title=title or f"{y_col} vs {x_col}",
                 template="plotly_white",
-                hover_data=df.columns.tolist()
+                hover_data=self._get_hover_columns(plot_df, x_col, y_col, color_col, size_col),
+                render_mode=render_mode
             )
             
             fig.update_layout(
@@ -88,12 +193,15 @@ class DataVisualizer:
                         color_col: Optional[str] = None, title: Optional[str] = None) -> go.Figure:
         """Create an interactive line plot"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, y_col, color_col)
+            plot_df = df[plot_columns].dropna(subset=[x_col, y_col]).copy()
+            plot_df = self._evenly_downsample(plot_df, self.max_line_points, sort_by=x_col)
             fig = px.line(
-                df, x=x_col, y=y_col,
+                plot_df, x=x_col, y=y_col,
                 color=color_col,
                 title=title or f"{y_col} over {x_col}",
                 template="plotly_white",
-                markers=True
+                markers=len(plot_df) <= 300
             )
             
             fig.update_layout(
@@ -114,11 +222,15 @@ class DataVisualizer:
         try:
             # Aggregate data if needed
             if pd.api.types.is_numeric_dtype(df[y_col]):
-                agg_df = df.groupby(x_col)[y_col].sum().reset_index()
+                group_cols = [x_col]
+                if color_col and color_col in df.columns and color_col not in group_cols:
+                    group_cols.append(color_col)
+                agg_df = df.groupby(group_cols, dropna=False)[y_col].sum().reset_index()
             else:
                 agg_df = df[x_col].value_counts().reset_index()
                 agg_df.columns = [x_col, 'count']
                 y_col = 'count'
+                color_col = None
             
             fig = px.bar(
                 agg_df, x=x_col, y=y_col,
@@ -143,12 +255,14 @@ class DataVisualizer:
                         color_col: Optional[str] = None, title: Optional[str] = None) -> go.Figure:
         """Create an interactive histogram"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, color_col)
+            plot_df = self._evenly_downsample(df[plot_columns].dropna(subset=[x_col]), self.max_histogram_points)
             fig = px.histogram(
-                df, x=x_col,
+                plot_df, x=x_col,
                 color=color_col,
                 title=title or f"Distribution of {x_col}",
                 template="plotly_white",
-                marginal="box"
+                marginal="box" if len(plot_df) <= 5000 else None
             )
             
             fig.update_layout(
@@ -167,8 +281,11 @@ class DataVisualizer:
                        color_col: Optional[str] = None, title: Optional[str] = None) -> go.Figure:
         """Create an interactive box plot"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, y_col, color_col)
+            plot_df = df[plot_columns].dropna(subset=[x_col, y_col]).copy()
+            plot_df, grouped_x_col = self._prepare_distribution_grouping(plot_df, x_col)
             fig = px.box(
-                df, x=x_col, y=y_col,
+                plot_df, x=grouped_x_col, y=y_col,
                 color=color_col,
                 title=title or f"{y_col} distribution by {x_col}",
                 template="plotly_white"
@@ -190,12 +307,16 @@ class DataVisualizer:
                           color_col: Optional[str] = None, title: Optional[str] = None) -> go.Figure:
         """Create an interactive violin plot"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, y_col, color_col)
+            plot_df = df[plot_columns].dropna(subset=[x_col, y_col]).copy()
+            plot_df, grouped_x_col = self._prepare_distribution_grouping(plot_df, x_col)
             fig = px.violin(
-                df, x=x_col, y=y_col,
+                plot_df, x=grouped_x_col, y=y_col,
                 color=color_col,
                 title=title or f"{y_col} distribution by {x_col}",
                 template="plotly_white",
-                box=True
+                box=True,
+                points=False
             )
             
             fig.update_layout(
@@ -243,10 +364,12 @@ class DataVisualizer:
         """Create a density plot"""
         try:
             fig = go.Figure()
+            plot_columns = self._get_hover_columns(df, x_col, color_col)
+            plot_df = self._evenly_downsample(df[plot_columns].dropna(subset=[x_col]), self.max_histogram_points)
             
-            if color_col and color_col in df.columns:
-                for category in df[color_col].unique():
-                    subset = df[df[color_col] == category]
+            if color_col and color_col in plot_df.columns:
+                for category in plot_df[color_col].dropna().unique():
+                    subset = plot_df[plot_df[color_col] == category]
                     fig.add_trace(go.Histogram(
                         x=subset[x_col],
                         histnorm='probability density',
@@ -255,7 +378,7 @@ class DataVisualizer:
                     ))
             else:
                 fig.add_trace(go.Histogram(
-                    x=df[x_col],
+                    x=plot_df[x_col],
                     histnorm='probability density',
                     name=x_col,
                     opacity=0.7
@@ -278,8 +401,11 @@ class DataVisualizer:
                         color_col: Optional[str] = None, title: Optional[str] = None) -> go.Figure:
         """Create an area plot"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, y_col, color_col)
+            plot_df = df[plot_columns].dropna(subset=[x_col, y_col]).copy()
+            plot_df = self._evenly_downsample(plot_df, self.max_line_points, sort_by=x_col)
             fig = px.area(
-                df, x=x_col, y=y_col,
+                plot_df, x=x_col, y=y_col,
                 color=color_col,
                 title=title or f"{y_col} over {x_col} (Area)",
                 template="plotly_white"
@@ -300,13 +426,19 @@ class DataVisualizer:
                           color_col: Optional[str] = None, title: Optional[str] = None) -> go.Figure:
         """Create a bubble plot"""
         try:
+            plot_columns = self._get_hover_columns(df, x_col, y_col, color_col, size_col)
+            plot_df = self._evenly_downsample(
+                df[plot_columns].dropna(subset=[x_col, y_col, size_col]),
+                self.max_scatter_points
+            )
             fig = px.scatter(
-                df, x=x_col, y=y_col,
+                plot_df, x=x_col, y=y_col,
                 size=size_col,
                 color=color_col,
                 title=title or f"Bubble Plot: {y_col} vs {x_col}",
                 template="plotly_white",
-                hover_data=df.columns.tolist()
+                hover_data=self._get_hover_columns(plot_df, x_col, y_col, color_col, size_col),
+                render_mode="webgl" if len(plot_df) > 1500 else "svg"
             )
             
             fig.update_layout(

@@ -1,52 +1,63 @@
-# Git
-.git
-.gitignore
-
-# CI/CD
-.github/
-
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+.Python
 *.egg-info/
+dist/
+build/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
+# Tests & coverage
+.pytest_cache/
+.coverage
+.coverage*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+tests/
+pytest-cache-files-*/
+
+# CI/CD
+.github/
+
+# Data files (mount as volumes instead)
+data/
+models/
+exports/
+*.csv
+*.xlsx
+*.xlsm
+*.parquet
+*.pkl
+*.joblib
+regression_model_bundle.zip
+
+# Git
+.git/
+.gitignore
+
 # IDE
 .vscode/
 .idea/
 
-# Tests & Coverage
-tests/
-htmlcov/
-.coverage
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-coverage.xml
+# Docker
+Dockerfile
+docker-compose*.yml
 
-# Data files
-data/
-*.csv
-*.xlsx
-*.parquet
-
-# Logs
-logs/
-*.log
-
-# Documentation
+# Docs
 *.md
+docs/
 LICENSE
 
-# OS files
+# Logs and OS files
+logs/
+*.log
 .DS_Store
 Thumbs.db
-
-# ML artifacts (models should be pre-built or fetched at runtime)
-models/
-*.pkl
-*.joblib

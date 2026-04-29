@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import tempfile
 import os
+from pathlib import Path
 
 
 # ─── Sample DataFrames ───────────────────────────────
@@ -73,6 +74,29 @@ def sample_excel_file(sample_mixed_df):
         filepath = f.name
     sample_mixed_df.to_excel(filepath, index=False)
     yield filepath
+    os.unlink(filepath)
+
+
+@pytest.fixture
+def sample_multisheet_excel_file(sample_mixed_df, sample_numeric_df):
+    """Create a temporary multi-sheet Excel workbook."""
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        filepath = f.name
+    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+        sample_mixed_df.to_excel(writer, sheet_name="people", index=False)
+        sample_numeric_df.to_excel(writer, sheet_name="metrics", index=False)
+    yield filepath
+    os.unlink(filepath)
+
+
+@pytest.fixture
+def sample_xlsm_file(sample_mixed_df):
+    """Create a temporary XLSM workbook."""
+    with tempfile.NamedTemporaryFile(suffix=".xlsm", delete=False) as f:
+        filepath = Path(f.name)
+    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+        sample_mixed_df.to_excel(writer, sheet_name="Sheet1", index=False)
+    yield str(filepath)
     os.unlink(filepath)
 
 

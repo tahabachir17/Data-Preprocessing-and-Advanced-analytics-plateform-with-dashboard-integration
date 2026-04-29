@@ -121,6 +121,7 @@ class Dashboard:
         # Organize plot types
         suggested_types = [pt for pt in suggestions if pt in all_plot_types]
         other_types = [pt for pt in all_plot_types if pt not in suggested_types]
+        plot_options = suggested_types + ["---"] + other_types
         
         # Display suggestions
         if suggested_types:
@@ -138,8 +139,8 @@ class Dashboard:
         
         plot_type = st.selectbox(
             "📈 Select plot type:",
-            suggested_types + ["---"] + other_types,
-            index=all_plot_types.index(default_plot) if default_plot in all_plot_types else 0,
+            plot_options,
+            index=plot_options.index(default_plot) if default_plot in plot_options else 0,
             key=f"{key_prefix}_plot_type",
             help="Choose the type of visualization"
         )
@@ -213,7 +214,8 @@ class Dashboard:
                         value=min(1000, len(df)),
                         key=f"{key_prefix}_sample_size"
                     )
-                    df = df.sample(n=sample_size, random_state=42)
+                    sample_idx = np.linspace(0, len(df) - 1, sample_size, dtype=int)
+                    df = df.iloc[sample_idx].copy()
                     st.info(f"Using {len(df):,} sampled rows")
             
             # Column-based filtering
