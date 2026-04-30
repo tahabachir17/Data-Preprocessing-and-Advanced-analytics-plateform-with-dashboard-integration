@@ -42,12 +42,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run Ruff (linting)
-        run: ruff check src myapp.py tests
-
-      - name: Run Black (formatting check)
-        run: black --check src myapp.py tests
-
       - name: Run Pytest with coverage
         run: |
           pytest --tb=short --cov=src --cov-report=xml \

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import pandas as pd
 
@@ -75,9 +75,7 @@ class DataLoader:
 
         extension = path.suffix.lower().lstrip(".")
         if extension not in ALLOWED_EXTENSIONS:
-            raise ValueError(
-                "Unsupported file format. Please use .csv, .xlsx, .xls, or .xlsm files."
-            )
+            raise ValueError("Unsupported file format. Please use .csv, .xlsx, .xls, or .xlsm files.")
 
         return path
 
@@ -101,10 +99,7 @@ class DataLoader:
 
     def _post_process_loaded_data(self, data: LoadedData) -> LoadedData:
         if isinstance(data, dict):
-            return {
-                sheet_name: self._post_process_dataframe(sheet_df)
-                for sheet_name, sheet_df in data.items()
-            }
+            return {sheet_name: self._post_process_dataframe(sheet_df) for sheet_name, sheet_df in data.items()}
         return self._post_process_dataframe(data)
 
     def _load_csv(self, path: Path) -> pd.DataFrame:
@@ -149,13 +144,11 @@ class DataLoader:
         for selected_sheet in selected_sheets:
             if isinstance(selected_sheet, str) and selected_sheet not in available_sheets:
                 raise ValueError(
-                    f"Sheet '{selected_sheet}' not found in '{path.name}'. "
-                    f"Available sheets: {available_sheets}"
+                    f"Sheet '{selected_sheet}' not found in '{path.name}'. " f"Available sheets: {available_sheets}"
                 )
 
         loaded_sheets = {
-            str(selected_sheet): self._load_excel_sheet(path, selected_sheet)
-            for selected_sheet in selected_sheets
+            str(selected_sheet): self._load_excel_sheet(path, selected_sheet) for selected_sheet in selected_sheets
         }
 
         if not load_all_sheets and sheet_name is not None and not isinstance(sheet_name, list):
@@ -222,9 +215,7 @@ class DataLoader:
                     logger.warning("Skipping '%s' during batch load: %s", path, exc)
 
         if failures and not skip_errors:
-            error_summary = "; ".join(
-                f"{path}: {message}" for path, message in failures.items()
-            )
+            error_summary = "; ".join(f"{path}: {message}" for path, message in failures.items())
             raise ValueError(f"Batch load failed for one or more files: {error_summary}")
 
         return loaded_data

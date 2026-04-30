@@ -1,9 +1,10 @@
 """Tests for src.data_processing.loader.DataLoader"""
 
+import os
+import tempfile
+
 import pandas as pd
 import pytest
-import tempfile
-import os
 
 from src.data_processing.loader import DataLoader
 
@@ -94,28 +95,34 @@ class TestDataLoader:
 
     def test_find_keyword_rows_returns_matching_indices(self):
         """Should find rows containing date-like keywords."""
-        df = pd.DataFrame({
-            "A": ["hello", "date", "world"],
-            "B": [1, 2, 3],
-        })
+        df = pd.DataFrame(
+            {
+                "A": ["hello", "date", "world"],
+                "B": [1, 2, 3],
+            }
+        )
         result = self.loader.find_keyword_rows(df, ["date"])
         assert 1 in result
 
     def test_find_keyword_rows_case_insensitive(self):
         """Should match keywords regardless of case."""
-        df = pd.DataFrame({
-            "A": ["TIMESTAMP", "data", "info"],
-            "B": [1, 2, 3],
-        })
+        df = pd.DataFrame(
+            {
+                "A": ["TIMESTAMP", "data", "info"],
+                "B": [1, 2, 3],
+            }
+        )
         result = self.loader.find_keyword_rows(df, ["timestamp"])
         assert 0 in result
 
     def test_find_keyword_rows_no_match(self):
         """Should return empty list when no keywords match."""
-        df = pd.DataFrame({
-            "A": ["hello", "world"],
-            "B": [1, 2],
-        })
+        df = pd.DataFrame(
+            {
+                "A": ["hello", "world"],
+                "B": [1, 2],
+            }
+        )
         result = self.loader.find_keyword_rows(df, ["nonexistent"])
         assert result == []
 
@@ -123,18 +130,21 @@ class TestDataLoader:
 
     def test_convert_object_columns_to_numeric(self):
         """Should convert mostly-numeric object columns to numeric dtype."""
-        df = pd.DataFrame({
-            "values": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
-        })
+        df = pd.DataFrame(
+            {
+                "values": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+            }
+        )
         result = self.loader._convert_object_columns_to_numeric(df.copy())
         assert pd.api.types.is_numeric_dtype(result["values"])
 
     def test_convert_object_columns_keeps_text(self):
         """Should NOT convert columns with mostly text values."""
-        df = pd.DataFrame({
-            "names": ["Alice", "Bob", "Charlie", "Diana", "Eve",
-                      "Frank", "Grace", "Henry", "Iris", "Jack"],
-        })
+        df = pd.DataFrame(
+            {
+                "names": ["Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Iris", "Jack"],
+            }
+        )
         result = self.loader._convert_object_columns_to_numeric(df.copy())
         assert result["names"].dtype == object
 

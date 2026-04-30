@@ -1,8 +1,6 @@
 """Tests for src.data_processing.cleaner.DataCleaner"""
 
 import pandas as pd
-import numpy as np
-import pytest
 
 from src.data_processing.cleaner import DataCleaner
 
@@ -56,8 +54,7 @@ class TestDataCleaner:
 
     def test_can_convert_to_numeric_false(self):
         """Should return False for a series with mostly text values."""
-        series = pd.Series(["Alice", "Bob", "Charlie", "Diana", "Eve",
-                            "Frank", "Grace", "Henry", "Iris", "Jack"])
+        series = pd.Series(["Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Iris", "Jack"])
         assert self.cleaner._can_convert_to_numeric(series) is False
 
     # ── Dtype Optimization ────────────────────────────

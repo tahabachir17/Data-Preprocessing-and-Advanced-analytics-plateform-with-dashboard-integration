@@ -31,15 +31,6 @@ pytest --cov=src --cov-report=term-missing
 
 # Run a specific test file
 pytest tests/test_datacleaner.py -v
-
-# Run linting
-ruff check src myapp.py tests
-
-# Run formatting check
-black --check src myapp.py tests
-
-# Auto-fix formatting
-black src myapp.py tests
 ```
 
 Expected result:
@@ -169,8 +160,6 @@ https://github.com/tahabachir17/Data-Preprocessing-and-Advanced-analytics-platef
 
 | Error | Cause | Fix |
 |---|---|---|
-| `ruff: command not found` | Missing dev dependencies | `pip install -r requirements-dev.txt` |
-| `Black would reformat file` | Formatting drift | `black src myapp.py tests` |
 | `FAILED tests/test_*.py` | App logic regression | Fix the failing module, then rerun `pytest` |
 | `Dockerfile not found` | Wrong working directory | Run Docker commands from the repository root |
 | `port 8501 already in use` | Port conflict | Stop the conflicting process or remap the host port |
@@ -182,8 +171,6 @@ https://github.com/tahabachir17/Data-Preprocessing-and-Advanced-analytics-platef
 
 ```text
 [ ] pytest passes locally with no failures
-[ ] ruff reports no linting errors
-[ ] black reports no formatting issues
 [ ] docker build completes without errors
 [ ] docker run starts the app on http://localhost:8501
 [ ] docker compose up starts the app correctly

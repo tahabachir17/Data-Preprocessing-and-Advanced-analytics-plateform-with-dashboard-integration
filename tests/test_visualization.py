@@ -1,8 +1,8 @@
 import pandas as pd
 
+from src.visualization import dashboard as dashboard_module
 from src.visualization.charts import DataVisualizer
 from src.visualization.dashboard import Dashboard
-from src.visualization import dashboard as dashboard_module
 
 
 class _DummyColumn:
@@ -39,12 +39,7 @@ def test_violin_plot_buckets_high_cardinality_datetime_axis():
     )
 
     fig = visualizer.create_violin_plot(df, "date_time", "reading")
-    rendered_groups = {
-        value
-        for trace in fig.data
-        for value in getattr(trace, "x", [])
-        if value is not None
-    }
+    rendered_groups = {value for trace in fig.data for value in getattr(trace, "x", []) if value is not None}
 
     assert len(rendered_groups) <= visualizer.max_distribution_groups
     assert len(rendered_groups) < df["date_time"].nunique()

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 import pandas as pd
 
 from src.utils.dataframe_utils import merge_date_and_time_columns, standardize_columns
@@ -119,9 +118,7 @@ class DataTransformer:
         if target_col not in df_standardized.columns:
             raise ValueError(f"Target column '{target_col}' not found in dataframe.")
 
-        categorical_columns = df_standardized.select_dtypes(
-            include=["object", "category"]
-        ).columns.tolist()
+        categorical_columns = df_standardized.select_dtypes(include=["object", "category"]).columns.tolist()
         target_encode_columns: list[str] = []
 
         for column in categorical_columns:

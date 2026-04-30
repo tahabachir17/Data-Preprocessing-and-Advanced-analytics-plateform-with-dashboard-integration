@@ -5,29 +5,34 @@ Provides statistical analysis, hypothesis testing, and advanced analytics capabi
 """
 
 __all__ = [
-    'StatisticalAnalyzer',
-    'AdvancedAnalytics',
-    'MLModels',
-    'SmartCategoricalEncoder',
-    'RegressionFeaturePreprocessor',
+    "AdvancedAnalytics",
+    "MLModels",
+    "RegressionFeaturePreprocessor",
+    "SmartCategoricalEncoder",
+    "StatisticalAnalyzer",
 ]
 
 
 def __getattr__(name):
     """Lazy import to avoid loading heavy dependencies at startup."""
-    if name == 'StatisticalAnalyzer':
+    if name == "StatisticalAnalyzer":
         from .statistical import StatisticalAnalyzer
+
         return StatisticalAnalyzer
-    elif name == 'AdvancedAnalytics':
+    elif name == "AdvancedAnalytics":
         from .advanced_analytics import AdvancedAnalytics
+
         return AdvancedAnalytics
-    elif name == 'MLModels':
+    elif name == "MLModels":
         from .ml_models import MLModels
+
         return MLModels
-    elif name == 'SmartCategoricalEncoder':
+    elif name == "SmartCategoricalEncoder":
         from .ml_models import SmartCategoricalEncoder
+
         return SmartCategoricalEncoder
-    elif name == 'RegressionFeaturePreprocessor':
+    elif name == "RegressionFeaturePreprocessor":
         from .ml_models import RegressionFeaturePreprocessor
+
         return RegressionFeaturePreprocessor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,8 +1,7 @@
 """Tests for src.data_processing.transformer.DataTransformer"""
 
-import pandas as pd
 import numpy as np
-import pytest
+import pandas as pd
 
 from src.data_processing.transformer import DataTransformer
 

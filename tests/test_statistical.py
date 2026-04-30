@@ -1,8 +1,7 @@
 """Tests for src.analytics.statistical.StatisticalAnalyzer"""
 
-import pandas as pd
 import numpy as np
-import pytest
+import pandas as pd
 
 from src.analytics.statistical import StatisticalAnalyzer
 
@@ -77,14 +76,18 @@ class TestStatisticalAnalyzer:
 
     def test_one_way_anova(self):
         """Should perform one-way ANOVA on grouped numeric data."""
-        df = pd.DataFrame({
-            "value": np.concatenate([
-                np.random.normal(10, 2, 30),
-                np.random.normal(20, 2, 30),
-                np.random.normal(30, 2, 30),
-            ]),
-            "group": ["A"] * 30 + ["B"] * 30 + ["C"] * 30,
-        })
+        df = pd.DataFrame(
+            {
+                "value": np.concatenate(
+                    [
+                        np.random.normal(10, 2, 30),
+                        np.random.normal(20, 2, 30),
+                        np.random.normal(30, 2, 30),
+                    ]
+                ),
+                "group": ["A"] * 30 + ["B"] * 30 + ["C"] * 30,
+            }
+        )
         result = self.analyzer.one_way_anova(df, "value", "group")
         assert isinstance(result, dict)
 
@@ -92,10 +95,12 @@ class TestStatisticalAnalyzer:
 
     def test_chi_square_independence(self):
         """Should perform chi-square independence test."""
-        df = pd.DataFrame({
-            "gender": np.random.choice(["M", "F"], size=200),
-            "preference": np.random.choice(["A", "B", "C"], size=200),
-        })
+        df = pd.DataFrame(
+            {
+                "gender": np.random.choice(["M", "F"], size=200),
+                "preference": np.random.choice(["A", "B", "C"], size=200),
+            }
+        )
         result = self.analyzer.chi_square_independence(df, "gender", "preference")
         assert isinstance(result, dict)
 
@@ -116,13 +121,17 @@ class TestStatisticalAnalyzer:
 
     def test_kruskal_wallis(self):
         """Should perform Kruskal-Wallis H test."""
-        df = pd.DataFrame({
-            "value": np.concatenate([
-                np.random.normal(10, 2, 30),
-                np.random.normal(15, 2, 30),
-            ]),
-            "group": ["A"] * 30 + ["B"] * 30,
-        })
+        df = pd.DataFrame(
+            {
+                "value": np.concatenate(
+                    [
+                        np.random.normal(10, 2, 30),
+                        np.random.normal(15, 2, 30),
+                    ]
+                ),
+                "group": ["A"] * 30 + ["B"] * 30,
+            }
+        )
         result = self.analyzer.kruskal_wallis(df, "value", "group")
         assert isinstance(result, dict)
 
